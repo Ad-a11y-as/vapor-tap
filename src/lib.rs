@@ -4,6 +4,8 @@
 //! Audio process taps on macOS 14.2 or newer. Captured samples are interleaved
 //! 32-bit floating-point PCM.
 
+pub mod asr;
+pub mod audio;
 mod error;
 mod platform;
 mod wav;

@@ -16,6 +16,14 @@ pub enum Error {
     ProcessNotFound(u32),
     #[error("native audio operation failed: {0}")]
     Native(String),
+    #[error("audio conversion failed: {0}")]
+    AudioConversion(String),
+    #[error("FunASR network operation failed: {0}")]
+    Network(String),
+    #[error("invalid FunASR protocol message: {0}")]
+    Protocol(String),
+    #[error("FunASR audio queue is full; audio continuity was lost")]
+    AudioQueueFull,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

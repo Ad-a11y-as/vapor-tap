@@ -1,6 +1,6 @@
 [package]
 name = "vapor-tap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Native per-process audio capture for Windows 11 and macOS 14.2+"
@@ -16,7 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+futures-util = "0.3"
+rubato = { version = "0.16.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 [target.'cfg(windows)'.dependencies]
 flexaudio-core = "0.2"

@@ -23,7 +23,7 @@ to create an audio stream.
 Find the PID that owns the application's audio output, then run:
 
 ```shell
-vapor-tap --pid 1234 --seconds 10 --output capture.wav
+vapor-tap capture --pid 1234 --seconds 10 --output capture.wav
 ```
 
 The WAV file contains interleaved 32-bit IEEE-float samples in the native
@@ -32,6 +32,53 @@ included. On macOS, pass the PID of the process that owns the Core Audio render
 stream. Multi-process applications such as WeChat may move audio to a helper
 process, so production integration should track and restart capture when that
 audio process changes.
+
+## Remote FunASR transcription
+
+FunASR runs independently and may be on another machine. Vapor Tap connects as
+a WebSocket client; the capture machine does not need Python, Docker, models,
+or a GPU.
+
+```shell
+vapor-tap transcribe \
+  --pid 1234 \
+  --seconds 60 \
+  --funasr-url wss://asr.example.com/ws \
+  --mode two-pass \
+  --text-output transcript.txt \
+  --json-output transcript.jsonl
+```
+
+For the standard FunASR runtime whose WebSocket is directly exposed on port
+10095, a local development command typically looks like:
+
+```shell
+vapor-tap transcribe --pid 1234 --funasr-url ws://127.0.0.1:10095
+```
+
+Captured audio is downmixed and resampled in a worker thread to mono, 16 kHz,
+signed PCM16 little-endian. It is sent as 60 ms binary messages. The audio does
+not need to be stored locally. Add `--save-audio original.wav` to retain the
+native float PCM at the same time.
+
+`two-pass` is the default recognition mode. Online messages are emitted as
+partial text and `2pass-offline` messages are appended as final text. The JSONL
+output distinguishes `partial`, `final`, `server_error`, and `disconnected`
+events. A bounded queue prevents unbounded memory growth; if it fills, the
+command fails with `AudioQueueFull` rather than silently losing speech.
+
+For bearer authentication, put the token in an environment variable rather
+than the command line:
+
+```shell
+# PowerShell
+$env:VAPOR_TAP_FUNASR_TOKEN = "secret"
+vapor-tap transcribe --pid 1234 --funasr-url wss://asr.example.com/ws
+```
+
+Use `wss://` over untrusted networks. A disconnect is reported explicitly and
+the command exits; restarting creates a new ASR session because the model cache
+from an interrupted WebSocket cannot be resumed safely.
 
 ## Library API
 
