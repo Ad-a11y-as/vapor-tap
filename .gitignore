@@ -1,0 +1,4 @@
+/target/
+*.wav
+*.pcm
+.DS_Store

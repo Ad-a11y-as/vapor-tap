@@ -1,0 +1,35 @@
+[package]
+name = "vapor-tap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native per-process audio capture for Windows 11 and macOS 14.2+"
+license = "MIT"
+
+[lib]
+name = "vapor_tap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vapor-tap"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+flexaudio-core = "0.2"
+flexaudio-os-windows = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+flexaudio-core = "0.2"
+objc2 = "0.6"
+objc2-core-audio = { version = "0.3", features = ["AudioHardware"] }
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFBase", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDictionary", "NSValue", "NSString", "NSUUID"] }
+
+[dev-dependencies]
+tempfile = "3"
