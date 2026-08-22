@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -49,9 +51,9 @@ struct CaptureArgs {
 struct TranscribeArgs {
     #[command(flatten)]
     source: SourceArgs,
-    /// Capture duration in seconds.
-    #[arg(long, default_value_t = 60)]
-    seconds: u64,
+    /// Optional capture duration in seconds. Omit to run until Ctrl+C.
+    #[arg(long)]
+    seconds: Option<u64>,
     /// Remote FunASR WebSocket URL (ws:// or wss://).
     #[arg(long)]
     funasr_url: String,
@@ -227,22 +229,27 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     });
 
     let seconds = args.seconds;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let audio_stop_requested = Arc::clone(&stop_requested);
     let save_audio = args.save_audio.clone();
-    let audio_task = tokio::task::spawn_blocking(move || -> Result<u64> {
+    let mut audio_task = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut session = CaptureSession::start(capture_config)?;
         if requested_process && session.mode() == CaptureMode::OutputLoopback {
             eprintln!(
                 "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
             );
         }
-        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let deadline = seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
         let mut normalizer = None;
         let mut wav = None;
         let mut sent_chunks = 0_u64;
 
-        while Instant::now() < deadline {
+        while !audio_stop_requested.load(Ordering::Acquire)
+            && deadline.is_none_or(|deadline| Instant::now() < deadline)
+        {
             let timeout = deadline
-                .saturating_duration_since(Instant::now())
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(250))
                 .min(Duration::from_millis(250));
             let Some(frame) = receive_frame(&session, timeout)? else {
                 continue;
@@ -279,8 +286,23 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
         Ok(sent_chunks)
     });
 
-    let audio_result = audio_task
-        .await
+    if seconds.is_none() {
+        eprintln!("transcribing continuously; press Ctrl+C to stop and finalize");
+    }
+    let audio_join = tokio::select! {
+        result = &mut audio_task => result,
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(error) = signal {
+                stop_requested.store(true, Ordering::Release);
+                let _ = audio_task.await;
+                return Err(Error::Io(error));
+            }
+            eprintln!("Ctrl+C received; stopping capture and waiting for the final FunASR result");
+            stop_requested.store(true, Ordering::Release);
+            audio_task.await
+        }
+    };
+    let audio_result = audio_join
         .map_err(|error| Error::Native(format!("audio conversion task failed: {error}")))?;
     let finish_result = client.finish().await;
     let event_result = event_task
@@ -436,4 +458,45 @@ fn optional_writer(path: Option<PathBuf>) -> Result<Option<BufWriter<File>>> {
         .transpose()
         .map(|file| file.map(BufWriter::new))
         .map_err(Error::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcribe_runs_until_ctrl_c_when_seconds_are_omitted() {
+        let cli = Cli::try_parse_from([
+            "vapor-tap",
+            "transcribe",
+            "--default-device",
+            "--funasr-url",
+            "ws://127.0.0.1:10095",
+        ])
+        .unwrap();
+
+        let Command::Transcribe(args) = cli.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(args.seconds, None);
+    }
+
+    #[test]
+    fn transcribe_accepts_an_optional_fixed_duration() {
+        let cli = Cli::try_parse_from([
+            "vapor-tap",
+            "transcribe",
+            "--default-device",
+            "--seconds",
+            "60",
+            "--funasr-url",
+            "ws://127.0.0.1:10095",
+        ])
+        .unwrap();
+
+        let Command::Transcribe(args) = cli.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(args.seconds, Some(60));
+    }
 }

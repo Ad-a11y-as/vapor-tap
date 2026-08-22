@@ -99,12 +99,13 @@ vapor-tap transcribe \
 ```shell
 vapor-tap transcribe \
   --app WeChat \
-  --seconds 60 \
   --funasr-url wss://asr.example.com/ws \
   --mode two-pass \
   --text-output transcript.txt \
   --json-output transcript.jsonl
 ```
+
+不指定 `--seconds` 时，转写会持续运行。按一次 `Ctrl+C` 后，Vapor Tap 会停止捕获、发送输入结束消息、等待 FunASR 返回最终结果，然后刷新并安全关闭文本、JSONL 和可选 WAV 文件。如需无人值守的固定时长任务，仍可使用 `--seconds 60` 等参数；即使指定了时长，也可以按 `Ctrl+C` 提前结束并正常收尾。
 
 发送给 FunASR 前，音频会在工作线程中转换为单声道、16 kHz、有符号 PCM16 小端格式，并以 60 毫秒的二进制消息发送。默认识别模式为 `two-pass`：在线结果作为临时文本输出，`2pass-offline` 结果作为最终文本追加。
 
@@ -265,12 +266,18 @@ Python, Docker, models, or a GPU.
 ```shell
 vapor-tap transcribe \
   --app WeChat \
-  --seconds 60 \
   --funasr-url wss://asr.example.com/ws \
   --mode two-pass \
   --text-output transcript.txt \
   --json-output transcript.jsonl
 ```
+
+When `--seconds` is omitted, transcription runs continuously. Pressing
+`Ctrl+C` once stops capture, sends the end-of-input message, waits for the final
+FunASR result, and then flushes and closes the text, JSONL, and optional WAV
+files. Use a value such as `--seconds 60` for unattended fixed-duration runs.
+`Ctrl+C` can also end a timed run early while preserving the same graceful
+shutdown sequence.
 
 For the standard FunASR runtime whose WebSocket is directly exposed on port
 10095, a local development command typically looks like:
