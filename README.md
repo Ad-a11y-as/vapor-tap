@@ -12,6 +12,27 @@ Vapor Tap 是一个使用 Rust 实现的跨平台应用音频捕获工具，可�
 
 公共 Rust API 与平台无关，输出交错排列的 `f32` PCM 音频数据。
 
+### 项目作用
+
+Vapor Tap 在桌面应用与音频处理服务之间提供一条轻量、可编程的音频通道，适合以下场景：
+
+- 捕获微信、浏览器、视频播放器、会议软件等应用正在播放的声音，用于录音、归档或后续分析。
+- 将音频实时发送给本机或远程 FunASR，把会议、课程、视频和通话内容转换成文字。
+- 同时输出 WAV 原始录音、纯文本和 JSONL 事件流，便于接入字幕生成、会议纪要、内容检索及其他自动化流程。
+- 作为 Rust 库嵌入其他程序，直接消费统一的 PCM 音频帧，无需从命令行启动子进程。
+- 枚举活跃音频应用和 Windows 输出设备，降低普通用户选择捕获来源的难度。
+
+### 核心优势
+
+- **跨平台接口统一**：Windows 10、Windows 11 和 macOS 共用相同的 CLI 与 Rust API，平台差异由内部后端处理。
+- **无需虚拟声卡**：直接使用 WASAPI 或 Core Audio，不要求用户安装虚拟音频设备或内核驱动，部署和卸载更简单。
+- **面向普通用户**：Windows 11 和 macOS 可发现正在输出声音的应用并按名称选择；Windows 10 自动捕获默认输出混音，无需查找 PID。
+- **适配多进程应用**：Windows 11 捕获目标进程及其子进程树，更适合浏览器、微信等由辅助进程实际播放音频的应用。
+- **录音与识别解耦**：FunASR 完全可选，并可独立部署在另一台机器；没有 FunASR 时仍可发现应用和录制 WAV。
+- **适合实时流水线**：音频格式转换和网络发送不在原生实时回调中执行，并使用有界队列限制内存增长。
+- **故障可见**：捕获后端终止、网络断开、服务端错误和 ASR 发送队列积压都会明确返回错误，避免将故障误认为静音或成功完成。
+- **输出便于集成**：既可保留无损的浮点 PCM WAV，也可直接获得纯文本和结构化 JSONL，方便后续编码、存储与业务处理。
+
 ### 构建
 
 ```shell
@@ -132,6 +153,47 @@ The public Rust API is platform-neutral and produces interleaved `f32` PCM.
 No virtual audio device or kernel driver is required.
 FunASR is an optional transcription backend; application discovery, capture,
 and WAV recording work without installing or connecting to FunASR.
+
+## Purpose
+
+Vapor Tap provides a lightweight, programmable audio path between desktop
+applications and downstream audio services. It can:
+
+- Capture audio played by messaging apps, browsers, media players, and meeting
+  software for recording, archiving, or analysis.
+- Stream audio to a local or remote FunASR service for live transcription of
+  meetings, courses, videos, and calls.
+- Produce native WAV recordings, plain text, and JSONL events for subtitle
+  generation, meeting notes, search, and other automated workflows.
+- Run as a Rust library so another application can consume uniform PCM audio
+  frames without managing a CLI subprocess.
+- Discover active audio applications and Windows output devices so users do not
+  have to locate process IDs manually.
+
+## Key advantages
+
+- **One cross-platform interface:** Windows 10, Windows 11, and macOS share the
+  same CLI and Rust API while platform-specific behavior stays inside the
+  capture backend.
+- **No virtual audio driver:** Direct WASAPI and Core Audio integration avoids
+  installing a virtual sound card or kernel driver.
+- **User-friendly source selection:** Windows 11 and macOS discover active audio
+  applications by name. Windows 10 automatically captures the default output
+  mix without asking users for a PID.
+- **Multi-process application support:** Windows 11 includes the selected
+  process tree, which helps with browsers and messaging apps that render audio
+  from helper processes.
+- **Capture and ASR are decoupled:** FunASR is optional and can run on another
+  machine. WAV recording and application discovery continue to work without it.
+- **Designed for realtime pipelines:** Format conversion and network work stay
+  outside native realtime callbacks, and bounded queues prevent uncontrolled
+  memory growth.
+- **Explicit failure reporting:** Backend termination, network disconnects,
+  server errors, and ASR queue pressure are surfaced as errors instead of being
+  mistaken for silence or successful completion.
+- **Integration-ready output:** Lossless float PCM WAV, plain text, and
+  structured JSONL support recording, encoding, storage, and downstream
+  application processing.
 
 ## Build
 
