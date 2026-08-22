@@ -22,7 +22,26 @@ macOS versions older than 14.2 remain unsupported.
 
 ## CLI smoke test
 
-Find the PID that owns the application's audio output, then run:
+Start audio playback in the target application. On Windows 11 and macOS, Vapor
+Tap discovers active audio applications and shows friendly names, so users do
+not need to find a PID:
+
+```shell
+vapor-tap apps
+vapor-tap capture --app WeChat --seconds 10 --output capture.wav
+vapor-tap transcribe --app Chrome --funasr-url ws://127.0.0.1:10095
+```
+
+When all source options are omitted, Windows 11 and macOS display an interactive
+numbered application picker. Windows 10 skips the picker and immediately
+captures the complete default output mix because application selection cannot
+provide isolation there:
+
+```shell
+vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
+```
+
+`--pid` remains available for automation and advanced integrations:
 
 ```shell
 vapor-tap capture --pid 1234 --seconds 10 --output capture.wav
@@ -51,7 +70,7 @@ or a GPU.
 
 ```shell
 vapor-tap transcribe \
-  --pid 1234 \
+  --app WeChat \
   --seconds 60 \
   --funasr-url wss://asr.example.com/ws \
   --mode two-pass \
@@ -63,7 +82,7 @@ For the standard FunASR runtime whose WebSocket is directly exposed on port
 10095, a local development command typically looks like:
 
 ```shell
-vapor-tap transcribe --pid 1234 --funasr-url ws://127.0.0.1:10095
+vapor-tap transcribe --app WeChat --funasr-url ws://127.0.0.1:10095
 ```
 
 Captured audio is downmixed and resampled in a worker thread to mono, 16 kHz,
@@ -83,7 +102,7 @@ than the command line:
 ```shell
 # PowerShell
 $env:VAPOR_TAP_FUNASR_TOKEN = "secret"
-vapor-tap transcribe --pid 1234 --funasr-url wss://asr.example.com/ws
+vapor-tap transcribe --app WeChat --funasr-url wss://asr.example.com/ws
 ```
 
 Use `wss://` over untrusted networks. A disconnect is reported explicitly and
@@ -125,6 +144,12 @@ classic `AUDCLNT_STREAMFLAGS_LOOPBACK` for the default render endpoint. It
 captures all applications using that endpoint, including system sounds. No
 virtual audio device or kernel driver is required for this fallback.
 
+Application discovery enumerates active render endpoints and their active
+`IAudioSessionControl2` sessions, obtains each session PID, and resolves the
+process executable name. On Windows 10 this list is diagnostic only; the normal
+no-source workflow intentionally skips selection and captures the default mix.
+On Windows 11 the selected PID is passed to process loopback.
+
 ## macOS permissions and packaging
 
 The distributed executable should be inside a signed application bundle with:
@@ -142,13 +167,17 @@ to `PermissionDenied` when Core Audio returns its usual permission error.
 
 The macOS backend creates a private process tap and private aggregate device.
 Both are stopped and destroyed when `CaptureSession` is stopped or dropped.
+Application discovery reads Core Audio's process object list and keeps objects
+whose `IsRunningOutput` property is true, exposing their PID and bundle ID.
 
 ## Current validation status
 
 - Windows target: compiled and unit-tested on build 19045. Both explicit
   default-device capture and automatic PID fallback were exercised against a
-  real Realtek output endpoint and produced non-silent PCM. A Windows 11 PID
-  smoke test is still required.
+  real Realtek output endpoint and produced non-silent PCM. Active session
+  discovery resolved a live `pwsh.exe` audio stream and `capture --app pwsh`
+  produced non-silent PCM. The no-source Win10 path skipped selection and also
+  captured non-silent PCM. A Windows 11 PID smoke test is still required.
 - macOS target: cross-compiled with `cargo check --target
   aarch64-apple-darwin`. Permission prompting and non-zero PCM require a macOS
   14.2+ machine for final validation.

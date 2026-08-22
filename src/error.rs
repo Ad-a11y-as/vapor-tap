@@ -14,6 +14,10 @@ pub enum Error {
     PermissionDenied,
     #[error("target process {0} has no active audio object")]
     ProcessNotFound(u32),
+    #[error("no currently playing audio application matches '{0}'")]
+    ApplicationNotFound(String),
+    #[error("application selector '{query}' is ambiguous; matches: {matches}")]
+    ApplicationAmbiguous { query: String, matches: String },
     #[error("native audio operation failed: {0}")]
     Native(String),
     #[error("audio conversion failed: {0}")]

@@ -1,6 +1,6 @@
 [package]
 name = "vapor-tap"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform application audio capture and remote speech transcription"
@@ -27,6 +27,7 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 [target.'cfg(windows)'.dependencies]
 flexaudio-core = "0.2"
 flexaudio-os-windows = "0.2"
+windows = { version = "=0.54.0", features = ["Win32_Devices_FunctionDiscovery", "Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Shell_PropertiesSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

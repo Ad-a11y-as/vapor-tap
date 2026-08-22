@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -7,9 +9,24 @@ use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::raw_ring;
 use flexaudio_core::types::ProcessMode;
 use flexaudio_os_windows::{WasapiProcessBackend, WasapiSystemBackend};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Media::Audio::{
+    AudioSessionStateActive, DEVICE_STATE_ACTIVE, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM_READ,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::core::{Interface, PWSTR};
 
 use crate::{
-    AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error, OutputDevice, Result,
+    AudioApplication, AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error,
+    OutputDevice, Result,
 };
 
 pub(crate) struct PlatformSession {
@@ -122,6 +139,10 @@ fn windows_build() -> Result<u32> {
     Ok(version.build)
 }
 
+pub(crate) fn process_isolation_supported() -> Result<bool> {
+    Ok(windows_build()? >= 20_348)
+}
+
 pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
     flexaudio_os_windows::list_output_devices()
         .map(|devices| {
@@ -136,6 +157,139 @@ pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
                 .collect()
         })
         .map_err(|error| Error::Native(error.to_string()))
+}
+
+pub(crate) fn list_audio_applications() -> Result<Vec<AudioApplication>> {
+    thread::Builder::new()
+        .name("vapor-tap-audio-apps".into())
+        .spawn(enumerate_audio_applications)
+        .map_err(Error::Io)?
+        .join()
+        .map_err(|_| Error::Native("audio application enumeration thread panicked".into()))?
+}
+
+fn enumerate_audio_applications() -> Result<Vec<AudioApplication>> {
+    let _com = ComGuard::new()?;
+    let mut applications = BTreeMap::<u32, AudioApplication>::new();
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|error| Error::Native(error.to_string()))?;
+        let devices = enumerator
+            .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+            .map_err(|error| Error::Native(error.to_string()))?;
+        let device_count = devices
+            .GetCount()
+            .map_err(|error| Error::Native(error.to_string()))?;
+
+        for device_index in 0..device_count {
+            let Ok(device) = devices.Item(device_index) else {
+                continue;
+            };
+            let device_name = endpoint_friendly_name(&device)
+                .unwrap_or_else(|| format!("Output {}", device_index + 1));
+            let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                continue;
+            };
+            let Ok(sessions) = manager.GetSessionEnumerator() else {
+                continue;
+            };
+            let Ok(session_count) = sessions.GetCount() else {
+                continue;
+            };
+            for session_index in 0..session_count {
+                let Ok(control) = sessions.GetSession(session_index) else {
+                    continue;
+                };
+                if control.GetState().ok() != Some(AudioSessionStateActive) {
+                    continue;
+                }
+                let Ok(control2): windows::core::Result<IAudioSessionControl2> = control.cast()
+                else {
+                    continue;
+                };
+                let Ok(pid) = control2.GetProcessId() else {
+                    continue;
+                };
+                if pid == 0 || pid == std::process::id() {
+                    continue;
+                }
+                let (process_name, identifier) = process_identity(pid)
+                    .or_else(|| session_display_name(&control).map(|name| (name, None)))
+                    .unwrap_or_else(|| (format!("PID {pid}"), None));
+                let application = applications.entry(pid).or_insert_with(|| AudioApplication {
+                    pid,
+                    name: process_name,
+                    identifier,
+                    output_devices: Vec::new(),
+                });
+                if !application.output_devices.contains(&device_name) {
+                    application.output_devices.push(device_name.clone());
+                }
+            }
+        }
+    }
+    let mut applications: Vec<_> = applications.into_values().collect();
+    applications.sort_by_key(|application| (application.name.to_lowercase(), application.pid));
+    Ok(applications)
+}
+
+struct ComGuard;
+
+impl ComGuard {
+    fn new() -> Result<Self> {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
+            .map_err(|error| Error::Native(error.to_string()))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Option<String> {
+    let store = unsafe { device.OpenPropertyStore(STGM_READ) }.ok()?;
+    let value = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.ok()?;
+    let name = value.to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+unsafe fn session_display_name(control: &IAudioSessionControl) -> Option<String> {
+    let display = unsafe { control.GetDisplayName() }.ok()?;
+    if display.is_null() {
+        return None;
+    }
+    let name = unsafe { display.to_string() }
+        .ok()
+        .filter(|name| !name.is_empty());
+    unsafe { CoTaskMemFree(Some(display.0.cast())) };
+    name
+}
+
+unsafe fn process_identity(pid: u32) -> Option<(String, Option<String>)> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    result.ok()?;
+    let path = String::from_utf16(&buffer[..length as usize]).ok()?;
+    let name = Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&path)
+        .to_owned();
+    Some((name, Some(path)))
 }
 
 impl PlatformSession {

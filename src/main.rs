@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,9 @@ use serde_json::json;
 use vapor_tap::asr::{AsrMode, FunAsrClient, FunAsrConfig, FunAsrEventReceiver, TranscriptEvent};
 use vapor_tap::audio::SpeechNormalizer;
 use vapor_tap::{
-    CaptureConfig, CaptureMode, CaptureSession, Error, Result, WavWriter, list_output_devices,
+    AudioApplication, CaptureConfig, CaptureMode, CaptureSession, CaptureSource, Error, Result,
+    WavWriter, list_audio_applications, list_output_devices, process_isolation_supported,
+    resolve_audio_application,
 };
 
 #[derive(Parser, Debug)]
@@ -20,11 +22,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List applications that currently have a running audio output stream.
+    Apps,
     /// List Windows output endpoints available for Windows 10 device capture.
     Devices,
-    /// Capture process audio to an IEEE-float WAV file.
+    /// Capture application or output-mix audio to an IEEE-float WAV file.
     Capture(CaptureArgs),
-    /// Stream process audio to a remote FunASR WebSocket service.
+    /// Stream application or output-mix audio to a remote FunASR WebSocket service.
     Transcribe(TranscribeArgs),
 }
 
@@ -74,12 +78,15 @@ struct TranscribeArgs {
 }
 
 #[derive(Args, Debug)]
-#[group(required = true, multiple = false)]
+#[group(multiple = false)]
 struct SourceArgs {
-    /// Target process ID. Its child-process tree is included on Windows 11.
+    /// Advanced target PID. Windows 10 ignores it and captures the default output mix.
     #[arg(long, value_name = "PID")]
     pid: Option<u32>,
-    /// Windows output endpoint name. Route only the target app to this device on Windows 10.
+    /// Select a playing app by name. Useful for Windows 11/macOS; optional on Windows 10.
+    #[arg(long, value_name = "QUERY")]
+    app: Option<String>,
+    /// Capture a named Windows output endpoint.
     #[arg(long, value_name = "NAME")]
     device: Option<String>,
     /// Capture the current default Windows output endpoint.
@@ -92,15 +99,25 @@ impl SourceArgs {
         if let Some(pid) = self.pid {
             return Ok(CaptureConfig::for_pid(pid));
         }
+        if let Some(query) = &self.app {
+            let application = resolve_audio_application(query)?;
+            println!("selected {} (PID {})", application.name, application.pid);
+            return Ok(CaptureConfig::for_pid(application.pid));
+        }
         if let Some(name) = &self.device {
             return Ok(CaptureConfig::for_output_device(name));
         }
         if self.default_device {
             return Ok(CaptureConfig::for_default_output());
         }
-        Err(Error::InvalidArgument(
-            "one of --pid, --device, or --default-device is required",
-        ))
+        if process_isolation_supported()? {
+            prompt_for_application().map(|application| CaptureConfig::for_pid(application.pid))
+        } else {
+            eprintln!(
+                "Windows 10: process isolation is unavailable; capturing the complete default output mix"
+            );
+            Ok(CaptureConfig::for_default_output())
+        }
     }
 }
 
@@ -132,6 +149,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Apps => print_audio_applications(&list_audio_applications()?),
         Command::Devices => {
             for device in list_output_devices()? {
                 let default = if device.is_default { " [default]" } else { "" };
@@ -152,8 +170,10 @@ async fn run() -> Result<()> {
 }
 
 fn capture_to_wav(args: CaptureArgs) -> Result<()> {
-    let mut session = CaptureSession::start(args.source.capture_config()?)?;
-    warn_if_pid_fell_back(&args.source, &session);
+    let config = args.source.capture_config()?;
+    let requested_process = matches!(config.source, CaptureSource::Process { .. });
+    let mut session = CaptureSession::start(config)?;
+    warn_if_process_fell_back(requested_process, &session);
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     let mut writer = None;
     let mut sample_frames = 0_u64;
@@ -185,6 +205,8 @@ fn capture_to_wav(args: CaptureArgs) -> Result<()> {
 }
 
 async fn transcribe(args: TranscribeArgs) -> Result<()> {
+    let capture_config = args.source.capture_config()?;
+    let requested_process = matches!(capture_config.source, CaptureSource::Process { .. });
     let mut config = FunAsrConfig::new(&args.funasr_url);
     config.mode = args.mode.into();
     config.hotwords = args.hotwords.clone();
@@ -202,13 +224,11 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
         write_transcript_events(events, text_output, json_output)
     });
 
-    let capture_config = args.source.capture_config()?;
-    let requested_pid = args.source.pid.is_some();
     let seconds = args.seconds;
     let save_audio = args.save_audio.clone();
     let audio_task = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut session = CaptureSession::start(capture_config)?;
-        if requested_pid && session.mode() == CaptureMode::OutputLoopback {
+        if requested_process && session.mode() == CaptureMode::OutputLoopback {
             eprintln!(
                 "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
             );
@@ -271,10 +291,57 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     Ok(())
 }
 
-fn warn_if_pid_fell_back(source: &SourceArgs, session: &CaptureSession) {
-    if source.pid.is_some() && session.mode() == CaptureMode::OutputLoopback {
+fn warn_if_process_fell_back(requested_process: bool, session: &CaptureSession) {
+    if requested_process && session.mode() == CaptureMode::OutputLoopback {
         eprintln!(
             "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
+        );
+    }
+}
+
+fn prompt_for_application() -> Result<AudioApplication> {
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::InvalidArgument(
+            "use --app, --pid, --device, or --default-device when stdin is not interactive",
+        ));
+    }
+    let applications = list_audio_applications()?;
+    if applications.is_empty() {
+        return Err(Error::ApplicationNotFound(
+            "any application; start audio playback and try again".into(),
+        ));
+    }
+    print_audio_applications(&applications);
+    print!("Select an application [1-{}]: ", applications.len());
+    std::io::stdout().flush()?;
+    let mut selection = String::new();
+    std::io::stdin().read_line(&mut selection)?;
+    let index = selection
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|index| (1..=applications.len()).contains(index))
+        .ok_or(Error::InvalidArgument("invalid application selection"))?;
+    Ok(applications[index - 1].clone())
+}
+
+fn print_audio_applications(applications: &[AudioApplication]) {
+    if applications.is_empty() {
+        println!("no applications are currently playing audio");
+        return;
+    }
+    for (index, application) in applications.iter().enumerate() {
+        let devices = if application.output_devices.is_empty() {
+            String::new()
+        } else {
+            format!(" -> {}", application.output_devices.join(", "))
+        };
+        println!(
+            "[{}] {} (PID {}){}",
+            index + 1,
+            application.name,
+            application.pid,
+            devices
         );
     }
 }

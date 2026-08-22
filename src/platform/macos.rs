@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::mem::{MaybeUninit, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,22 +26,25 @@ use objc2_core_audio::{
     AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
     AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
     AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectID,
-    AudioObjectPropertyAddress, CATapDescription, kAudioAggregateDeviceIsPrivateKey,
+    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, CATapDescription, kAudioAggregateDeviceIsPrivateKey,
     kAudioAggregateDeviceIsStackedKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
-    kAudioAggregateDeviceUIDKey, kAudioHardwarePropertyTranslatePIDToProcessObject,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+    kAudioAggregateDeviceUIDKey, kAudioHardwarePropertyProcessObjectList,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
     kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
 };
 use objc2_core_audio_types::{
     AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp, kAudioFormatFlagIsFloat,
 };
-use objc2_core_foundation::CFDictionary;
+use objc2_core_foundation::{CFDictionary, CFString};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSString, NSUUID};
 
 use crate::{
-    AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error, OutputDevice, Result,
+    AudioApplication, AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error,
+    OutputDevice, Result,
 };
 
 const NO_ERR: i32 = 0;
@@ -182,6 +186,111 @@ pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
     Err(Error::UnsupportedPlatform(
         "output endpoint enumeration is available only on Windows",
     ))
+}
+
+pub(crate) fn list_audio_applications() -> Result<Vec<AudioApplication>> {
+    ensure_supported_version()?;
+    let objects = process_object_list()?;
+    let mut applications = Vec::new();
+    for object in objects {
+        let is_running = unsafe {
+            audio_property::<u32>(object, kAudioProcessPropertyIsRunningOutput).unwrap_or(0)
+        };
+        if is_running == 0 {
+            continue;
+        }
+        let Some(pid) = (unsafe { audio_property::<i32>(object, kAudioProcessPropertyPID) }) else {
+            continue;
+        };
+        let Ok(pid) = u32::try_from(pid) else {
+            continue;
+        };
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        let identifier = unsafe { process_bundle_identifier(object) };
+        let name = identifier
+            .as_deref()
+            .and_then(|identifier| identifier.rsplit('.').next())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("PID {pid}"));
+        applications.push(AudioApplication {
+            pid,
+            name,
+            identifier,
+            output_devices: Vec::new(),
+        });
+    }
+    applications.sort_by_key(|application| (application.name.to_lowercase(), application.pid));
+    applications.dedup_by_key(|application| application.pid);
+    Ok(applications)
+}
+
+pub(crate) fn process_isolation_supported() -> Result<bool> {
+    ensure_supported_version()?;
+    Ok(true)
+}
+
+fn process_object_list() -> Result<Vec<AudioObjectID>> {
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut byte_count = 0_u32;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject as AudioObjectID,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut byte_count),
+        )
+    };
+    check_status("read audio process list size", status)?;
+    let count = byte_count as usize / size_of::<AudioObjectID>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut objects = vec![0; count];
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as AudioObjectID,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut byte_count),
+            NonNull::new(objects.as_mut_ptr().cast()).expect("non-empty object list"),
+        )
+    };
+    check_status("read audio process list", status)?;
+    objects.truncate(byte_count as usize / size_of::<AudioObjectID>());
+    Ok(objects)
+}
+
+unsafe fn audio_property<T: Copy>(object: AudioObjectID, selector: u32) -> Option<T> {
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut byte_count = size_of::<T>() as u32;
+    let mut value = MaybeUninit::<T>::uninit();
+    let status = AudioObjectGetPropertyData(
+        object,
+        NonNull::from(&mut address),
+        0,
+        std::ptr::null(),
+        NonNull::from(&mut byte_count),
+        NonNull::new(value.as_mut_ptr().cast())?,
+    );
+    (status == NO_ERR && byte_count as usize == size_of::<T>()).then(|| value.assume_init())
+}
+
+unsafe fn process_bundle_identifier(object: AudioObjectID) -> Option<String> {
+    let bundle = audio_property::<*const CFString>(object, kAudioProcessPropertyBundleID)?;
+    bundle.as_ref().map(ToString::to_string)
 }
 
 impl PlatformSession {

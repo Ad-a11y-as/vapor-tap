@@ -57,6 +57,18 @@ pub struct OutputDevice {
     pub is_default: bool,
 }
 
+/// An application with a currently running audio output stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioApplication {
+    pub pid: u32,
+    /// Human-readable process or application name.
+    pub name: String,
+    /// Executable path on Windows or bundle identifier on macOS, when known.
+    pub identifier: Option<String>,
+    /// Windows output endpoint names used by this application, when known.
+    pub output_devices: Vec<String>,
+}
+
 /// Native mechanism selected for a running capture session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
@@ -106,6 +118,84 @@ impl CaptureConfig {
 /// Lists active Windows render endpoints available for output-loopback capture.
 pub fn list_output_devices() -> Result<Vec<OutputDevice>> {
     platform::list_output_devices()
+}
+
+/// Lists applications that currently have a running output audio stream.
+/// Start playback before calling this function so the application is visible.
+pub fn list_audio_applications() -> Result<Vec<AudioApplication>> {
+    platform::list_audio_applications()
+}
+
+/// Returns whether this operating system can isolate capture by process.
+/// Windows 10 returns `false`; Windows build 20348+ and macOS 14.2+ return
+/// `true`.
+pub fn process_isolation_supported() -> Result<bool> {
+    platform::process_isolation_supported()
+}
+
+/// Resolves a PID, exact application name/identifier, or unique substring to
+/// one currently running audio application.
+pub fn resolve_audio_application(query: &str) -> Result<AudioApplication> {
+    let applications = list_audio_applications()?;
+    resolve_audio_application_from(query, &applications)
+}
+
+fn resolve_audio_application_from(
+    query: &str,
+    applications: &[AudioApplication],
+) -> Result<AudioApplication> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(Error::InvalidArgument(
+            "application selector must not be empty",
+        ));
+    }
+    if let Ok(pid) = query.parse::<u32>()
+        && let Some(application) = applications
+            .iter()
+            .find(|application| application.pid == pid)
+    {
+        return Ok(application.clone());
+    }
+
+    let query_lower = query.to_lowercase();
+    let matches_query = |application: &&AudioApplication, exact: bool| {
+        let name = application.name.to_lowercase();
+        let identifier = application
+            .identifier
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase();
+        if exact {
+            name == query_lower || identifier == query_lower
+        } else {
+            name.contains(&query_lower) || identifier.contains(&query_lower)
+        }
+    };
+    let exact: Vec<_> = applications
+        .iter()
+        .filter(|app| matches_query(app, true))
+        .collect();
+    let matches = if exact.is_empty() {
+        applications
+            .iter()
+            .filter(|app| matches_query(app, false))
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    match matches.as_slice() {
+        [application] => Ok((*application).clone()),
+        [] => Err(Error::ApplicationNotFound(query.into())),
+        many => Err(Error::ApplicationAmbiguous {
+            query: query.into(),
+            matches: many
+                .iter()
+                .map(|application| format!("{} (PID {})", application.name, application.pid))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
+    }
 }
 
 /// A running native capture session.
@@ -194,5 +284,75 @@ mod tests {
             CaptureConfig::for_default_output().source,
             CaptureSource::OutputDevice { name: None }
         );
+    }
+
+    #[test]
+    fn application_model_can_describe_an_output_session() {
+        let application = AudioApplication {
+            pid: 42,
+            name: "player.exe".into(),
+            identifier: Some("C:\\Apps\\player.exe".into()),
+            output_devices: vec!["Speakers".into()],
+        };
+        assert_eq!(application.pid, 42);
+        assert_eq!(application.name, "player.exe");
+    }
+
+    #[test]
+    fn application_selector_supports_exact_and_unique_substring_matches() {
+        let applications = vec![
+            AudioApplication {
+                pid: 10,
+                name: "WeChat.exe".into(),
+                identifier: Some("C:\\Apps\\WeChat.exe".into()),
+                output_devices: vec!["Speakers".into()],
+            },
+            AudioApplication {
+                pid: 20,
+                name: "chrome.exe".into(),
+                identifier: Some("C:\\Apps\\chrome.exe".into()),
+                output_devices: vec!["Speakers".into()],
+            },
+        ];
+        assert_eq!(
+            resolve_audio_application_from("wechat", &applications)
+                .unwrap()
+                .pid,
+            10
+        );
+        assert_eq!(
+            resolve_audio_application_from("CHROME.EXE", &applications)
+                .unwrap()
+                .pid,
+            20
+        );
+        assert_eq!(
+            resolve_audio_application_from("20", &applications)
+                .unwrap()
+                .pid,
+            20
+        );
+    }
+
+    #[test]
+    fn application_selector_reports_ambiguity() {
+        let applications = vec![
+            AudioApplication {
+                pid: 10,
+                name: "chrome.exe".into(),
+                identifier: None,
+                output_devices: vec![],
+            },
+            AudioApplication {
+                pid: 20,
+                name: "chrome.exe".into(),
+                identifier: None,
+                output_devices: vec![],
+            },
+        ];
+        assert!(matches!(
+            resolve_audio_application_from("chrome", &applications),
+            Err(Error::ApplicationAmbiguous { .. })
+        ));
     }
 }
