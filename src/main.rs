@@ -142,6 +142,38 @@ impl From<ModeArg> for AsrMode {
     }
 }
 
+struct CtrlCSignal {
+    #[cfg(windows)]
+    listener: tokio::signal::windows::CtrlC,
+}
+
+impl CtrlCSignal {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                listener: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = self.listener.recv().await;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            tokio::signal::ctrl_c().await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -231,6 +263,10 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     let seconds = args.seconds;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let audio_stop_requested = Arc::clone(&stop_requested);
+    // Keep the Windows listener alive through FunASR finalization. Tokio's
+    // console handler delegates to the default terminating handler when no
+    // Ctrl+C receivers remain.
+    let mut ctrl_c = CtrlCSignal::new()?;
     let save_audio = args.save_audio.clone();
     let mut audio_task = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut session = CaptureSession::start(capture_config)?;
@@ -291,7 +327,7 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     }
     let audio_join = tokio::select! {
         result = &mut audio_task => result,
-        signal = tokio::signal::ctrl_c() => {
+        signal = ctrl_c.recv() => {
             if let Err(error) = signal {
                 stop_requested.store(true, Ordering::Release);
                 let _ = audio_task.await;
