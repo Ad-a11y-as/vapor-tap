@@ -2,7 +2,7 @@
 
 ## 中文说明
 
-Vapor Tap 是一个使用 Rust 实现的跨平台应用音频捕获工具，可将捕获到的声音保存为 WAV，或实时发送到独立部署的 FunASR 服务进行语音转文字。它不需要安装虚拟声卡或内核驱动。
+Vapor Tap 是一个使用 Rust 实现的跨平台应用音频捕获工具，可独立捕获声音并保存为 WAV。FunASR 只是可选的语音转文字后端：不安装、不配置或不连接 FunASR，也可以正常完成应用发现、音频捕获和本地录音。Vapor Tap 不需要安装虚拟声卡或内核驱动。
 
 支持的平台和捕获方式：
 
@@ -22,10 +22,10 @@ cargo build --release
 
 ### 普通用户快速使用
 
-先在微信、浏览器、视频播放器或其他目标应用中开始播放声音，然后运行：
+先在微信、浏览器、视频播放器或其他目标应用中开始播放声音。仅捕获音频并保存为 WAV 时，不需要 FunASR：
 
 ```shell
-vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
+vapor-tap capture --seconds 10 --output capture.wav
 ```
 
 不同系统的行为如下：
@@ -71,9 +71,9 @@ vapor-tap transcribe \
 
 当前项目不直接输出 MP3。如有长期存储和空间要求，可在捕获完成后使用 FFmpeg 等工具将 WAV 转换为 MP3、AAC、Opus 或 FLAC；用于语音识别时，直接发送 PCM 可避免额外的编解码延迟和音质损失。
 
-### 连接远程 FunASR
+### 可选：连接远程 FunASR
 
-FunASR 可以独立运行，也可以部署在另一台机器上。捕获端只作为 WebSocket 客户端，不需要安装 Python、Docker、模型或 GPU。
+只有需要将声音实时转换成文字时才需要 FunASR；单纯捕获或保存 WAV 不依赖 FunASR。FunASR 可以独立运行，也可以部署在另一台机器上。捕获端只作为 WebSocket 客户端，不需要安装 Python、Docker、模型或 GPU。
 
 ```shell
 vapor-tap transcribe \
@@ -130,6 +130,8 @@ Cross-platform application audio capture for:
 
 The public Rust API is platform-neutral and produces interleaved `f32` PCM.
 No virtual audio device or kernel driver is required.
+FunASR is an optional transcription backend; application discovery, capture,
+and WAV recording work without installing or connecting to FunASR.
 
 ## Build
 
@@ -160,6 +162,12 @@ captures the complete default output mix because application selection cannot
 provide isolation there:
 
 ```shell
+vapor-tap capture --seconds 10 --output capture.wav
+```
+
+To transcribe instead of only recording, connect the optional FunASR backend:
+
+```shell
 vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
 ```
 
@@ -184,11 +192,12 @@ vapor-tap capture --default-device --seconds 10 --output capture.wav
 vapor-tap capture --device "Speakers (Realtek Audio)" --seconds 10 --output capture.wav
 ```
 
-## Remote FunASR transcription
+## Optional remote FunASR transcription
 
-FunASR runs independently and may be on another machine. Vapor Tap connects as
-a WebSocket client; the capture machine does not need Python, Docker, models,
-or a GPU.
+FunASR is required only for live speech-to-text. Audio capture and WAV recording
+do not depend on it. FunASR runs independently and may be on another machine.
+Vapor Tap connects as a WebSocket client; the capture machine does not need
+Python, Docker, models, or a GPU.
 
 ```shell
 vapor-tap transcribe \
