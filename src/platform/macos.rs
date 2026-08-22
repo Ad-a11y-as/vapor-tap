@@ -48,6 +48,13 @@ use crate::{
 };
 
 const NO_ERR: i32 = 0;
+
+#[derive(Clone, Copy)]
+enum TapTarget {
+    Process(u32),
+    Global,
+}
+
 #[allow(clippy::type_complexity)]
 struct TapChain {
     aggregate_id: AudioObjectID,
@@ -100,11 +107,14 @@ pub(crate) fn start(
     CaptureMode,
 )> {
     ensure_supported_version()?;
-    let pid = match config.source {
-        CaptureSource::Process { pid } => pid,
-        CaptureSource::OutputDevice { .. } => {
+    let (target, mode) = match config.source {
+        CaptureSource::Process { pid } => (TapTarget::Process(pid), CaptureMode::ProcessLoopback),
+        CaptureSource::OutputDevice { name: None } => {
+            (TapTarget::Global, CaptureMode::OutputLoopback)
+        }
+        CaptureSource::OutputDevice { name: Some(_) } => {
             return Err(Error::UnsupportedPlatform(
-                "output endpoint capture is available only on Windows",
+                "named output endpoint capture is available only on Windows",
             ));
         }
     };
@@ -121,13 +131,8 @@ pub(crate) fn start(
         .name("vapor-tap-coreaudio".into())
         .spawn(move || {
             let result = (|| unsafe {
-                let process_object = translate_pid(pid)?;
-                let (chain, format) = build_tap_chain(
-                    process_object,
-                    sink,
-                    Arc::clone(&thread_stop),
-                    tap_runtime_errors,
-                )?;
+                let (chain, format) =
+                    build_tap_chain(target, sink, Arc::clone(&thread_stop), tap_runtime_errors)?;
                 let _ = ready_sender.send(Ok(format));
                 while !thread_stop.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(10));
@@ -183,7 +188,7 @@ pub(crate) fn start(
                 },
                 receiver,
                 runtime_error_receiver,
-                CaptureMode::ProcessLoopback,
+                mode,
             ))
         }
         Ok(Err(error)) => {
@@ -356,16 +361,36 @@ unsafe fn translate_pid(pid: u32) -> Result<AudioObjectID> {
 }
 
 unsafe fn build_tap_chain(
-    process_object: AudioObjectID,
+    target: TapTarget,
     sink: RawSink,
     callback_stopped: Arc<AtomicBool>,
     runtime_errors: mpsc::SyncSender<Error>,
 ) -> Result<(TapChain, AudioFormat)> {
-    let process_number = NSNumber::numberWithUnsignedInt(process_object);
-    let processes = NSArray::from_retained_slice(&[process_number]);
-    let description =
-        CATapDescription::initStereoMixdownOfProcesses(CATapDescription::alloc(), &processes);
-    description.setName(&NSString::from_str("Vapor Tap Process Capture"));
+    let (description, name) = match target {
+        TapTarget::Process(pid) => {
+            let process_object = translate_pid(pid)?;
+            let process_number = NSNumber::numberWithUnsignedInt(process_object);
+            let processes = NSArray::from_retained_slice(&[process_number]);
+            (
+                CATapDescription::initStereoMixdownOfProcesses(
+                    CATapDescription::alloc(),
+                    &processes,
+                ),
+                "Vapor Tap Process Capture",
+            )
+        }
+        TapTarget::Global => {
+            let excluded: Retained<NSArray<NSNumber>> = NSArray::from_retained_slice(&[]);
+            (
+                CATapDescription::initStereoGlobalTapButExcludeProcesses(
+                    CATapDescription::alloc(),
+                    &excluded,
+                ),
+                "Vapor Tap System Audio Capture",
+            )
+        }
+    };
+    description.setName(&NSString::from_str(name));
     description.setPrivate(true);
     let tap_uid = description.UUID().UUIDString();
 

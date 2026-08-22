@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +12,7 @@ use vapor_tap::asr::{AsrMode, FunAsrClient, FunAsrConfig, FunAsrEventReceiver, T
 use vapor_tap::audio::SpeechNormalizer;
 use vapor_tap::{
     AudioApplication, CaptureConfig, CaptureMode, CaptureSession, CaptureSource, Error, Result,
-    WavWriter, list_audio_applications, list_output_devices, process_isolation_supported,
-    resolve_audio_application,
+    WavWriter, list_audio_applications, resolve_audio_application,
 };
 
 #[derive(Parser, Debug)]
@@ -27,8 +26,6 @@ struct Cli {
 enum Command {
     /// List applications that currently have a running audio output stream.
     Apps,
-    /// List Windows output endpoints available for Windows 10 device capture.
-    Devices,
     /// Capture application or output-mix audio to an IEEE-float WAV file.
     Capture(CaptureArgs),
     /// Stream application or output-mix audio to a remote FunASR WebSocket service.
@@ -86,15 +83,12 @@ struct SourceArgs {
     /// Advanced target PID. Windows 10 ignores it and captures the default output mix.
     #[arg(long, value_name = "PID")]
     pid: Option<u32>,
-    /// Select a playing app by name. Useful for Windows 11/macOS; optional on Windows 10.
+    /// Isolate a playing app by name on Windows 11/macOS. Windows 10 falls back to system audio.
     #[arg(long, value_name = "QUERY")]
     app: Option<String>,
-    /// Capture a named Windows output endpoint.
-    #[arg(long, value_name = "NAME")]
-    device: Option<String>,
-    /// Capture the current default Windows output endpoint.
-    #[arg(long)]
-    default_device: bool,
+    /// Deprecated compatibility alias; system audio is already the default.
+    #[arg(long = "default-device", hide = true)]
+    _default_device: bool,
 }
 
 impl SourceArgs {
@@ -107,20 +101,8 @@ impl SourceArgs {
             println!("selected {} (PID {})", application.name, application.pid);
             return Ok(CaptureConfig::for_pid(application.pid));
         }
-        if let Some(name) = &self.device {
-            return Ok(CaptureConfig::for_output_device(name));
-        }
-        if self.default_device {
-            return Ok(CaptureConfig::for_default_output());
-        }
-        if process_isolation_supported()? {
-            prompt_for_application().map(|application| CaptureConfig::for_pid(application.pid))
-        } else {
-            eprintln!(
-                "Windows 10: process isolation is unavailable; capturing the complete default output mix"
-            );
-            Ok(CaptureConfig::for_default_output())
-        }
+        eprintln!("capturing system audio; use --app NAME or --pid PID to isolate an application");
+        Ok(CaptureConfig::for_default_output())
     }
 }
 
@@ -185,15 +167,6 @@ async fn main() {
 async fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Apps => print_audio_applications(&list_audio_applications()?),
-        Command::Devices => {
-            for device in list_output_devices()? {
-                let default = if device.is_default { " [default]" } else { "" };
-                println!(
-                    "{}{} ({} Hz, {} ch)",
-                    device.name, default, device.sample_rate, device.channels
-                );
-            }
-        }
         Command::Capture(args) => {
             tokio::task::spawn_blocking(move || capture_to_wav(args))
                 .await
@@ -382,32 +355,6 @@ fn receive_frame(
     }
 }
 
-fn prompt_for_application() -> Result<AudioApplication> {
-    if !std::io::stdin().is_terminal() {
-        return Err(Error::InvalidArgument(
-            "use --app, --pid, --device, or --default-device when stdin is not interactive",
-        ));
-    }
-    let applications = list_audio_applications()?;
-    if applications.is_empty() {
-        return Err(Error::ApplicationNotFound(
-            "any application; start audio playback and try again".into(),
-        ));
-    }
-    print_audio_applications(&applications);
-    print!("Select an application [1-{}]: ", applications.len());
-    std::io::stdout().flush()?;
-    let mut selection = String::new();
-    std::io::stdin().read_line(&mut selection)?;
-    let index = selection
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|index| (1..=applications.len()).contains(index))
-        .ok_or(Error::InvalidArgument("invalid application selection"))?;
-    Ok(applications[index - 1].clone())
-}
-
 fn print_audio_applications(applications: &[AudioApplication]) {
     if applications.is_empty() {
         println!("no applications are currently playing audio");
@@ -505,7 +452,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "vapor-tap",
             "transcribe",
-            "--default-device",
             "--funasr-url",
             "ws://127.0.0.1:10095",
         ])
@@ -522,7 +468,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "vapor-tap",
             "transcribe",
-            "--default-device",
             "--seconds",
             "60",
             "--funasr-url",
@@ -534,5 +479,23 @@ mod tests {
             panic!("expected transcribe command");
         };
         assert_eq!(args.seconds, Some(60));
+    }
+
+    #[test]
+    fn omitted_source_defaults_to_system_audio() {
+        let cli = Cli::try_parse_from(["vapor-tap", "capture"]).unwrap();
+        let Command::Capture(args) = cli.command else {
+            panic!("expected capture command");
+        };
+
+        assert_eq!(
+            args.source.capture_config().unwrap().source,
+            CaptureSource::OutputDevice { name: None }
+        );
+    }
+
+    #[test]
+    fn named_output_device_is_not_a_cli_option() {
+        assert!(Cli::try_parse_from(["vapor-tap", "capture", "--device", "Speakers"]).is_err());
     }
 }

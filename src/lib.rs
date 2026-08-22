@@ -1,8 +1,8 @@
 //! Cross-platform application audio capture.
 //!
 //! The platform backends use WASAPI process loopback on Windows 11 and Core
-//! Audio process taps on macOS 14.2 or newer. Windows 10 is supported by
-//! capturing the default output endpoint mix when PID isolation is unavailable.
+//! Audio process or global taps on macOS 14.2 or newer. Windows 10 is supported
+//! by capturing the default output endpoint mix when PID isolation is unavailable.
 //! Captured samples are interleaved 32-bit floating-point PCM.
 
 pub mod asr;
@@ -42,8 +42,9 @@ pub enum CaptureSource {
     /// Audio rendered by a process tree. On Windows 10 this automatically
     /// falls back to the complete default output mix and the PID is ignored.
     Process { pid: u32 },
-    /// The complete mix rendered to one Windows output endpoint. `None` means
-    /// the current default output endpoint. This works on Windows 10 and later.
+    /// System-wide output audio. `None` selects the default system mix on
+    /// Windows or a global Core Audio tap on macOS. A named endpoint is an
+    /// advanced Windows-only library feature.
     OutputDevice { name: Option<String> },
 }
 
@@ -74,7 +75,7 @@ pub struct AudioApplication {
 pub enum CaptureMode {
     /// The operating system isolates one process tree.
     ProcessLoopback,
-    /// The complete mix sent to one output endpoint is captured.
+    /// The system-wide output mix is captured.
     OutputLoopback,
 }
 
@@ -106,7 +107,9 @@ impl CaptureConfig {
         }
     }
 
-    /// Captures the complete mix sent to the current default Windows output.
+    /// Captures system-wide output audio without a virtual audio device.
+    /// Windows uses the current default output endpoint; macOS uses a global
+    /// Core Audio tap.
     pub fn for_default_output() -> Self {
         Self {
             source: CaptureSource::OutputDevice { name: None },

@@ -6,9 +6,9 @@ Vapor Tap 是一个使用 Rust 实现的跨平台应用音频捕获工具，可�
 
 支持的平台和捕获方式：
 
-- Windows 10 22H2（build 19045）：通过 WASAPI 回环捕获默认输出设备的混合音频。由于该系统不支持按进程隔离音频，因此无需选择应用；使用时应尽量保证只有目标应用在播放声音。
-- Windows 11（build 20348 或更高版本）：通过 WASAPI 进程回环捕获指定应用及其子进程的音频。
-- macOS 14.2 或更高版本：通过 Core Audio 进程 Tap 捕获指定应用的音频。
+- Windows 10 22H2（build 19045）：默认通过 WASAPI 回环捕获系统混合音频。该系统不支持按进程隔离；即使指定应用，也会退化为系统混音。
+- Windows 11（build 20348 或更高版本）：默认通过 WASAPI 捕获系统混合音频；使用 `--app` 或 `--pid` 时，通过进程回环隔离目标应用及其子进程。
+- macOS 14.2 或更高版本：默认通过 Core Audio 全局 Tap 捕获系统音频；使用 `--app` 或 `--pid` 时改用进程 Tap。
 
 公共 Rust API 与平台无关，输出交错排列的 `f32` PCM 音频数据。
 
@@ -20,13 +20,13 @@ Vapor Tap 在桌面应用与音频处理服务之间提供一条轻量、可编�
 - 将音频实时发送给本机或远程 FunASR，把会议、课程、视频和通话内容转换成文字。
 - 同时输出 WAV 原始录音、纯文本和 JSONL 事件流，便于接入字幕生成、会议纪要、内容检索及其他自动化流程。
 - 作为 Rust 库嵌入其他程序，直接消费统一的 PCM 音频帧，无需从命令行启动子进程。
-- 枚举活跃音频应用和 Windows 输出设备，降低普通用户选择捕获来源的难度。
+- 枚举活跃音频应用，并在需要隔离时支持按应用名称选择。
 
 ### 核心优势
 
 - **跨平台接口统一**：Windows 10、Windows 11 和 macOS 共用相同的 CLI 与 Rust API，平台差异由内部后端处理。
 - **无需虚拟声卡**：直接使用 WASAPI 或 Core Audio，不要求用户安装虚拟音频设备或内核驱动，部署和卸载更简单。
-- **面向普通用户**：Windows 11 和 macOS 可发现正在输出声音的应用并按名称选择；Windows 10 自动捕获默认输出混音，无需查找 PID。
+- **默认即可使用**：不指定来源时，Windows 和 macOS 都直接捕获系统音频；只有需要隔离声音时才使用 `--app` 或 `--pid`。
 - **适配多进程应用**：Windows 11 捕获目标进程及其子进程树，更适合浏览器、微信等由辅助进程实际播放音频的应用。
 - **录音与识别解耦**：FunASR 完全可选，并可独立部署在另一台机器；没有 FunASR 时仍可发现应用和录制 WAV。
 - **适合实时流水线**：音频格式转换和网络发送不在原生实时回调中执行，并使用有界队列限制内存增长。
@@ -49,10 +49,7 @@ cargo build --release
 vapor-tap capture --seconds 10 --output capture.wav
 ```
 
-不同系统的行为如下：
-
-- Windows 10：直接捕获默认输出设备的全部混合音频，不显示应用选择菜单。
-- Windows 11 和 macOS：自动检测当前正在输出声音的应用，并显示编号菜单供用户选择，不需要用户查找 PID。
+Windows 10、Windows 11 和 macOS 都会在未指定来源时直接捕获系统音频，不显示应用选择菜单。系统通知和其他应用的声音也会被包含；需要隔离时再指定应用。
 
 也可以先查看检测到的应用，再通过名称选择：
 
@@ -69,14 +66,6 @@ vapor-tap capture --pid 1234 --seconds 10 --output capture.wav
 ```
 
 在 Windows 10 上，即使指定了 `--app` 或 `--pid`，程序也会自动退化为默认输出设备的混合音频，并显示警告。Windows 11 会包含目标 PID 的子进程树；微信、浏览器等多进程应用的音频可能由辅助进程输出。
-
-Windows 还支持查看和指定输出设备：
-
-```shell
-vapor-tap devices
-vapor-tap capture --default-device --seconds 10 --output capture.wav
-vapor-tap capture --device "Speakers (Realtek Audio)" --seconds 10 --output capture.wav
-```
 
 ### 音频存储格式
 
@@ -129,17 +118,17 @@ macOS 可执行文件应放入已签名的应用包中，并在 `Info.plist` 中
 <key>LSMinimumSystemVersion</key>
 <string>14.2</string>
 <key>NSAudioCaptureUsageDescription</key>
-<string>Capture audio from the application selected by the user.</string>
+<string>Capture system or application audio selected by the user.</string>
 ```
 
-用户需要在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中授予权限。程序停止或 `CaptureSession` 被释放时，会清理创建的进程 Tap 和聚合设备。
+用户需要在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中授予权限。程序停止或 `CaptureSession` 被释放时，会清理创建的全局/进程 Tap 和聚合设备。
 
 ### 当前验证状态
 
-- Windows 10 build 19045：已在本机使用真实 Realtek 输出设备完成编译、单元测试和实际回环捕获，能够获取非静音 PCM；应用发现、`--app` 捕获以及不指定来源时的自动混音捕获均已验证。
+- Windows 10 build 19045：已在本机完成编译、单元测试和实际回环调用，但最近一次保存的 WAV 全部为零采样；真实非静音捕获仍需继续排查，不能视为已验证。
 - Windows 11：代码已完成编译和单元测试，仍需在 Windows 11 真机上完成按 PID 捕获的最终验证。
-- macOS：已通过 `aarch64-apple-darwin` 目标交叉检查，权限弹窗和真实非零音频仍需在 macOS 14.2 或更高版本的真机上验证。
-- FunASR：已使用实际远程模型服务完成端到端验证，能够发送捕获的 PCM、接收在线及离线结果，并等待最终结束确认。测试服务使用不受系统信任的自签名证书，因此测试时通过临时 TLS 代理连接；直接使用 `wss://` 前仍需配置可信证书。
+- macOS：全局与进程 Tap 已通过 `aarch64-apple-darwin` 目标交叉检查，权限弹窗和真实非零音频仍需在 macOS 14.2 或更高版本的真机上验证。
+- FunASR：已使用实际远程模型服务验证 WebSocket 上行、在线/离线结果和最终结束确认。测试服务使用不受系统信任的自签名证书，因此测试时通过临时 TLS 代理连接；最近一次 Windows 捕获为全零 PCM，识别内容属于模型对静音的错误输出，尚不能作为识别质量验证。
 
 ---
 
@@ -148,8 +137,8 @@ macOS 可执行文件应放入已签名的应用包中，并在 `Info.plist` 中
 Cross-platform application audio capture for:
 
 - Windows 10 (default output mix through WASAPI loopback)
-- Windows 11 (WASAPI process loopback)
-- macOS 14.2 or newer (Core Audio process taps)
+- Windows 11 (system mix by default, optional WASAPI process loopback)
+- macOS 14.2 or newer (global system-audio or per-process Core Audio taps)
 
 The public Rust API is platform-neutral and produces interleaved `f32` PCM.
 No virtual audio device or kernel driver is required.
@@ -169,8 +158,8 @@ applications and downstream audio services. It can:
   generation, meeting notes, search, and other automated workflows.
 - Run as a Rust library so another application can consume uniform PCM audio
   frames without managing a CLI subprocess.
-- Discover active audio applications and Windows output devices so users do not
-  have to locate process IDs manually.
+- Discover active audio applications and select them by name when isolation is
+  needed, so users do not have to locate process IDs manually.
 
 ## Key advantages
 
@@ -179,9 +168,8 @@ applications and downstream audio services. It can:
   capture backend.
 - **No virtual audio driver:** Direct WASAPI and Core Audio integration avoids
   installing a virtual sound card or kernel driver.
-- **User-friendly source selection:** Windows 11 and macOS discover active audio
-  applications by name. Windows 10 automatically captures the default output
-  mix without asking users for a PID.
+- **Useful by default:** With no source option, Windows and macOS capture system
+  audio immediately. Use `--app` or `--pid` only when isolation is needed.
 - **Multi-process application support:** Windows 11 includes the selected
   process tree, which helps with browsers and messaging apps that render audio
   from helper processes.
@@ -210,29 +198,22 @@ macOS versions older than 14.2 remain unsupported.
 
 ## CLI smoke test
 
-Start audio playback in the target application. On Windows 11 and macOS, Vapor
-Tap discovers active audio applications and shows friendly names, so users do
-not need to find a PID:
+Start audio playback before capture. With no source option, every supported
+platform captures system-wide output audio without showing an application
+picker:
+
+```shell
+vapor-tap capture --seconds 10 --output capture.wav
+vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
+```
+
+To isolate an application on Windows 11 or macOS, list active applications and
+select one by name; users do not need to find a PID:
 
 ```shell
 vapor-tap apps
 vapor-tap capture --app WeChat --seconds 10 --output capture.wav
 vapor-tap transcribe --app Chrome --funasr-url ws://127.0.0.1:10095
-```
-
-When all source options are omitted, Windows 11 and macOS display an interactive
-numbered application picker. Windows 10 skips the picker and immediately
-captures the complete default output mix because application selection cannot
-provide isolation there:
-
-```shell
-vapor-tap capture --seconds 10 --output capture.wav
-```
-
-To transcribe instead of only recording, connect the optional FunASR backend:
-
-```shell
-vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
 ```
 
 `--pid` remains available for automation and advanced integrations:
@@ -247,14 +228,6 @@ included. On Windows 10, the PID is ignored and a warning reports that the
 default output mix is being captured. On macOS, pass the PID of the process that
 owns the Core Audio render stream. Multi-process applications such as WeChat
 may move audio to a helper process on platforms using true process capture.
-
-Windows output endpoints can also be selected explicitly:
-
-```shell
-vapor-tap devices
-vapor-tap capture --default-device --seconds 10 --output capture.wav
-vapor-tap capture --device "Speakers (Realtek Audio)" --seconds 10 --output capture.wav
-```
 
 ## Optional remote FunASR transcription
 
@@ -351,9 +324,9 @@ virtual audio device or kernel driver is required for this fallback.
 
 Application discovery enumerates active render endpoints and their active
 `IAudioSessionControl2` sessions, obtains each session PID, and resolves the
-process executable name. On Windows 10 this list is diagnostic only; the normal
-no-source workflow intentionally skips selection and captures the default mix.
-On Windows 11 the selected PID is passed to process loopback.
+process executable name. The normal no-source workflow captures the default
+mix on every Windows version. On Windows 11 an explicitly selected application
+PID is passed to process loopback; on Windows 10 it falls back to the mix.
 
 ## macOS permissions and packaging
 
@@ -363,31 +336,31 @@ The distributed executable should be inside a signed application bundle with:
 <key>LSMinimumSystemVersion</key>
 <string>14.2</string>
 <key>NSAudioCaptureUsageDescription</key>
-<string>Capture audio from the application selected by the user.</string>
+<string>Capture system or application audio selected by the user.</string>
 ```
 
 The user must grant the app access under **System Settings → Privacy &
 Security → Screen & System Audio Recording**. A denied Core Audio tap is mapped
 to `PermissionDenied` when Core Audio returns its usual permission error.
 
-The macOS backend creates a private process tap and private aggregate device.
-Both are stopped and destroyed when `CaptureSession` is stopped or dropped.
-Application discovery reads Core Audio's process object list and keeps objects
-whose `IsRunningOutput` property is true, exposing their PID and bundle ID.
+The macOS backend creates a private global tap for the default no-source flow or
+a private process tap for `--app`/`--pid`, together with a private aggregate
+device. All are stopped and destroyed when `CaptureSession` is stopped or
+dropped. Application discovery reads Core Audio's process object list and keeps
+objects whose `IsRunningOutput` property is true, exposing their PID and bundle
+ID.
 
 ## Current validation status
 
-- Windows target: compiled and unit-tested on build 19045. Both explicit
-  default-device capture and automatic PID fallback were exercised against a
-  real Realtek output endpoint and produced non-silent PCM. Active session
-  discovery resolved a live `pwsh.exe` audio stream and `capture --app pwsh`
-  produced non-silent PCM. The no-source Win10 path skipped selection and also
-  captured non-silent PCM. A Windows 11 PID smoke test is still required.
-- macOS target: cross-compiled with `cargo check --target
+- Windows target: compiled and unit-tested on build 19045, and the real WASAPI
+  loopback path was exercised. The latest saved WAV contained only zero
+  samples, so non-silent capture remains under investigation and must not be
+  treated as validated. A Windows 11 PID smoke test is also still required.
+- macOS target: global and process taps cross-compile with `cargo check --target
   aarch64-apple-darwin`. Permission prompting and non-zero PCM require a macOS
   14.2+ machine for final validation.
-- FunASR: exercised end to end against a real remote model service, including
-  captured PCM upload, online and offline results, and the final end-of-input
-  acknowledgement. The test service used an untrusted self-signed certificate,
-  so a temporary TLS proxy was used; direct `wss://` access still requires a
-  trusted certificate.
+- FunASR: the WebSocket upload, online/offline responses, and final
+  acknowledgement were exercised against a real remote service through a
+  temporary TLS proxy because its certificate was untrusted. The latest Windows
+  input was all-zero PCM, so the server's text was a silence hallucination and
+  does not validate recognition quality.
