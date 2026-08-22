@@ -39,7 +39,9 @@ use objc2_core_audio_types::{
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSString, NSUUID};
 
-use crate::{AudioFormat, AudioFrame, CaptureConfig, Error, Result};
+use crate::{
+    AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error, OutputDevice, Result,
+};
 
 const NO_ERR: i32 = 0;
 #[allow(clippy::type_complexity)]
@@ -87,8 +89,16 @@ pub(crate) struct PlatformSession {
 
 pub(crate) fn start(
     config: CaptureConfig,
-) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>)> {
+) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>, CaptureMode)> {
     ensure_supported_version()?;
+    let pid = match config.source {
+        CaptureSource::Process { pid } => pid,
+        CaptureSource::OutputDevice { .. } => {
+            return Err(Error::UnsupportedPlatform(
+                "output endpoint capture is available only on Windows",
+            ));
+        }
+    };
     let (producer, mut consumer) = raw_ring(48_000 * 2 * 2);
     let sink = RawSink::new(producer, 48_000, 2);
     let (sender, receiver) = mpsc::sync_channel(config.channel_capacity);
@@ -100,7 +110,7 @@ pub(crate) fn start(
         .name("vapor-tap-coreaudio".into())
         .spawn(move || {
             let result = (|| unsafe {
-                let process_object = translate_pid(config.pid)?;
+                let process_object = translate_pid(pid)?;
                 let (chain, format) = build_tap_chain(process_object, sink)?;
                 let _ = ready_sender.send(Ok(format));
                 while !thread_stop.load(Ordering::Acquire) {
@@ -152,6 +162,7 @@ pub(crate) fn start(
                     stopped: false,
                 },
                 receiver,
+                CaptureMode::ProcessLoopback,
             ))
         }
         Ok(Err(error)) => {
@@ -165,6 +176,12 @@ pub(crate) fn start(
             ))
         }
     }
+}
+
+pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
+    Err(Error::UnsupportedPlatform(
+        "output endpoint enumeration is available only on Windows",
+    ))
 }
 
 impl PlatformSession {

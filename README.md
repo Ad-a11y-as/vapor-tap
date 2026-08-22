@@ -1,7 +1,8 @@
 # vapor-tap
 
-Native per-process audio capture for:
+Cross-platform application audio capture for:
 
+- Windows 10 (default output mix through WASAPI loopback)
 - Windows 11 (WASAPI process loopback)
 - macOS 14.2 or newer (Core Audio process taps)
 
@@ -14,9 +15,10 @@ No virtual audio device or kernel driver is required.
 cargo build --release
 ```
 
-The crate is intentionally unsupported on Windows builds older than 20348 and
-macOS versions older than 14.2. It returns `UnsupportedOsVersion` before trying
-to create an audio stream.
+On Windows 10, a PID request automatically falls back to the complete default
+output mix because PID-isolated loopback requires build 20348 or newer. This is
+appropriate when the target application is the only active audio source.
+macOS versions older than 14.2 remain unsupported.
 
 ## CLI smoke test
 
@@ -27,11 +29,19 @@ vapor-tap capture --pid 1234 --seconds 10 --output capture.wav
 ```
 
 The WAV file contains interleaved 32-bit IEEE-float samples in the native
-capture format. On Windows, the target PID and its child-process tree are
-included. On macOS, pass the PID of the process that owns the Core Audio render
-stream. Multi-process applications such as WeChat may move audio to a helper
-process, so production integration should track and restart capture when that
-audio process changes.
+capture format. On Windows 11, the target PID and its child-process tree are
+included. On Windows 10, the PID is ignored and a warning reports that the
+default output mix is being captured. On macOS, pass the PID of the process that
+owns the Core Audio render stream. Multi-process applications such as WeChat
+may move audio to a helper process on platforms using true process capture.
+
+Windows output endpoints can also be selected explicitly:
+
+```shell
+vapor-tap devices
+vapor-tap capture --default-device --seconds 10 --output capture.wav
+vapor-tap capture --device "Speakers (Realtek Audio)" --seconds 10 --output capture.wav
+```
 
 ## Remote FunASR transcription
 
@@ -105,12 +115,15 @@ Do not perform encoding or network I/O in a native audio callback.
 
 ## Windows details
 
-The Windows backend activates `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` with
+On build 20348 or newer, the Windows backend activates
+`VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` with
 `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`. It uses 48 kHz stereo
 floating-point PCM and includes audio rendered by the PID's descendants.
 
-Windows 10 22H2 build 19045 is rejected because Microsoft requires build 20348
-or later for process loopback.
+On Windows 10 22H2 build 19045, `CaptureConfig::for_pid` transparently selects
+classic `AUDCLNT_STREAMFLAGS_LOOPBACK` for the default render endpoint. It
+captures all applications using that endpoint, including system sounds. No
+virtual audio device or kernel driver is required for this fallback.
 
 ## macOS permissions and packaging
 
@@ -132,8 +145,10 @@ Both are stopped and destroyed when `CaptureSession` is stopped or dropped.
 
 ## Current validation status
 
-- Windows target: compiled and unit-tested on build 19045; the version rejection
-  path was exercised. A Windows 11 audio-device smoke test is still required.
+- Windows target: compiled and unit-tested on build 19045. Both explicit
+  default-device capture and automatic PID fallback were exercised against a
+  real Realtek output endpoint and produced non-silent PCM. A Windows 11 PID
+  smoke test is still required.
 - macOS target: cross-compiled with `cargo check --target
   aarch64-apple-darwin`. Permission prompting and non-zero PCM require a macOS
   14.2+ machine for final validation.

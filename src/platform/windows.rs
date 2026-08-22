@@ -6,16 +6,14 @@ use std::time::Duration;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::raw_ring;
 use flexaudio_core::types::ProcessMode;
-use flexaudio_os_windows::WasapiProcessBackend;
+use flexaudio_os_windows::{WasapiProcessBackend, WasapiSystemBackend};
 
-use crate::{AudioFormat, AudioFrame, CaptureConfig, Error, Result};
-
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: u16 = 2;
-const PACKET_FRAMES: usize = 960; // 20 ms
+use crate::{
+    AudioFormat, AudioFrame, CaptureConfig, CaptureMode, CaptureSource, Error, OutputDevice, Result,
+};
 
 pub(crate) struct PlatformSession {
-    backend: WasapiProcessBackend,
+    backend: Box<dyn CaptureBackend>,
     stop: Arc<AtomicBool>,
     drain: Option<JoinHandle<()>>,
     stopped: bool,
@@ -23,16 +21,29 @@ pub(crate) struct PlatformSession {
 
 pub(crate) fn start(
     config: CaptureConfig,
-) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>)> {
-    ensure_supported_version()?;
-    let format = AudioFormat {
-        sample_rate: SAMPLE_RATE,
-        channels: CHANNELS,
+) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>, CaptureMode)> {
+    let (mut backend, mode): (Box<dyn CaptureBackend>, CaptureMode) = match config.source {
+        CaptureSource::Process { pid } if windows_build()? >= 20_348 => (
+            Box::new(WasapiProcessBackend::new(pid, ProcessMode::Include)),
+            CaptureMode::ProcessLoopback,
+        ),
+        CaptureSource::Process { .. } => (
+            Box::new(WasapiSystemBackend::new(false, None)),
+            CaptureMode::OutputLoopback,
+        ),
+        CaptureSource::OutputDevice { name } => (
+            Box::new(WasapiSystemBackend::new(false, name)),
+            CaptureMode::OutputLoopback,
+        ),
     };
-    let ring_samples = SAMPLE_RATE as usize * CHANNELS as usize * 2;
+    let (sample_rate, channels) = backend.native_format();
+    let format = AudioFormat {
+        sample_rate,
+        channels,
+    };
+    let ring_samples = sample_rate as usize * channels as usize * 2;
     let (producer, mut consumer) = raw_ring(ring_samples);
-    let sink = RawSink::new(producer, SAMPLE_RATE, CHANNELS);
-    let mut backend = WasapiProcessBackend::new(config.pid, ProcessMode::Include);
+    let sink = RawSink::new(producer, sample_rate, channels);
     backend
         .start(sink)
         .map_err(|error| Error::Native(error.to_string()))?;
@@ -43,7 +54,7 @@ pub(crate) fn start(
     let drain = thread::Builder::new()
         .name("vapor-tap-pcm-drain".into())
         .spawn(move || {
-            let packet_samples = PACKET_FRAMES * CHANNELS as usize;
+            let packet_samples = (sample_rate as usize / 50).max(1) * usize::from(channels);
             let mut samples = vec![0.0; packet_samples];
             while !drain_stop.load(Ordering::Acquire) {
                 if consumer.available() < packet_samples {
@@ -70,6 +81,7 @@ pub(crate) fn start(
             stopped: false,
         },
         receiver,
+        mode,
     ))
 }
 
@@ -88,7 +100,7 @@ unsafe extern "system" {
     fn RtlGetVersion(version: *mut RtlOsVersionInfo) -> i32;
 }
 
-fn ensure_supported_version() -> Result<()> {
+fn windows_build() -> Result<u32> {
     let mut version = RtlOsVersionInfo {
         size: size_of::<RtlOsVersionInfo>() as u32,
         major: 0,
@@ -104,10 +116,26 @@ fn ensure_supported_version() -> Result<()> {
             "RtlGetVersion failed with NTSTATUS {status:#x}"
         )));
     }
-    if version.build < 20_348 {
+    if version.major < 10 {
         return Err(Error::UnsupportedOsVersion);
     }
-    Ok(())
+    Ok(version.build)
+}
+
+pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
+    flexaudio_os_windows::list_output_devices()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .map(|device| OutputDevice {
+                    name: device.name,
+                    sample_rate: device.sample_rate,
+                    channels: device.channels,
+                    is_default: device.is_default,
+                })
+                .collect()
+        })
+        .map_err(|error| Error::Native(error.to_string()))
 }
 
 impl PlatformSession {

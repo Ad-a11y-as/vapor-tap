@@ -8,7 +8,7 @@ pub enum Error {
     InvalidArgument(&'static str),
     #[error("unsupported operating system: {0}")]
     UnsupportedPlatform(&'static str),
-    #[error("the operating system version does not support process audio capture")]
+    #[error("the operating system version does not support the requested audio capture mode")]
     UnsupportedOsVersion,
     #[error("audio capture permission was denied")]
     PermissionDenied,

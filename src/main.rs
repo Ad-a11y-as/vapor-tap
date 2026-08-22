@@ -7,10 +7,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use vapor_tap::asr::{AsrMode, FunAsrClient, FunAsrConfig, FunAsrEventReceiver, TranscriptEvent};
 use vapor_tap::audio::SpeechNormalizer;
-use vapor_tap::{CaptureConfig, CaptureSession, Error, Result, WavWriter};
+use vapor_tap::{
+    CaptureConfig, CaptureMode, CaptureSession, Error, Result, WavWriter, list_output_devices,
+};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Capture or transcribe audio produced by one process")]
+#[command(version, about = "Capture or transcribe application audio")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List Windows output endpoints available for Windows 10 device capture.
+    Devices,
     /// Capture process audio to an IEEE-float WAV file.
     Capture(CaptureArgs),
     /// Stream process audio to a remote FunASR WebSocket service.
@@ -26,9 +30,8 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct CaptureArgs {
-    /// Target process ID. On Windows its child-process tree is included.
-    #[arg(long)]
-    pid: u32,
+    #[command(flatten)]
+    source: SourceArgs,
     /// Capture duration in seconds.
     #[arg(long, default_value_t = 10)]
     seconds: u64,
@@ -39,9 +42,8 @@ struct CaptureArgs {
 
 #[derive(Args, Debug)]
 struct TranscribeArgs {
-    /// Target process ID. On Windows its child-process tree is included.
-    #[arg(long)]
-    pid: u32,
+    #[command(flatten)]
+    source: SourceArgs,
     /// Capture duration in seconds.
     #[arg(long, default_value_t = 60)]
     seconds: u64,
@@ -69,6 +71,37 @@ struct TranscribeArgs {
     /// FunASR audio queue capacity in 60 ms chunks.
     #[arg(long, default_value_t = 128)]
     queue_capacity: usize,
+}
+
+#[derive(Args, Debug)]
+#[group(required = true, multiple = false)]
+struct SourceArgs {
+    /// Target process ID. Its child-process tree is included on Windows 11.
+    #[arg(long, value_name = "PID")]
+    pid: Option<u32>,
+    /// Windows output endpoint name. Route only the target app to this device on Windows 10.
+    #[arg(long, value_name = "NAME")]
+    device: Option<String>,
+    /// Capture the current default Windows output endpoint.
+    #[arg(long)]
+    default_device: bool,
+}
+
+impl SourceArgs {
+    fn capture_config(&self) -> Result<CaptureConfig> {
+        if let Some(pid) = self.pid {
+            return Ok(CaptureConfig::for_pid(pid));
+        }
+        if let Some(name) = &self.device {
+            return Ok(CaptureConfig::for_output_device(name));
+        }
+        if self.default_device {
+            return Ok(CaptureConfig::for_default_output());
+        }
+        Err(Error::InvalidArgument(
+            "one of --pid, --device, or --default-device is required",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -99,6 +132,15 @@ async fn main() {
 
 async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Devices => {
+            for device in list_output_devices()? {
+                let default = if device.is_default { " [default]" } else { "" };
+                println!(
+                    "{}{} ({} Hz, {} ch)",
+                    device.name, default, device.sample_rate, device.channels
+                );
+            }
+        }
         Command::Capture(args) => {
             tokio::task::spawn_blocking(move || capture_to_wav(args))
                 .await
@@ -110,7 +152,8 @@ async fn run() -> Result<()> {
 }
 
 fn capture_to_wav(args: CaptureArgs) -> Result<()> {
-    let mut session = CaptureSession::start(CaptureConfig::for_pid(args.pid))?;
+    let mut session = CaptureSession::start(args.source.capture_config()?)?;
+    warn_if_pid_fell_back(&args.source, &session);
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     let mut writer = None;
     let mut sample_frames = 0_u64;
@@ -159,11 +202,17 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
         write_transcript_events(events, text_output, json_output)
     });
 
-    let pid = args.pid;
+    let capture_config = args.source.capture_config()?;
+    let requested_pid = args.source.pid.is_some();
     let seconds = args.seconds;
     let save_audio = args.save_audio.clone();
     let audio_task = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let mut session = CaptureSession::start(CaptureConfig::for_pid(pid))?;
+        let mut session = CaptureSession::start(capture_config)?;
+        if requested_pid && session.mode() == CaptureMode::OutputLoopback {
+            eprintln!(
+                "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
+            );
+        }
         let deadline = Instant::now() + Duration::from_secs(seconds);
         let mut normalizer = None;
         let mut wav = None;
@@ -220,6 +269,14 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     event_result?;
     println!("sent {sent_chunks} audio chunks to FunASR");
     Ok(())
+}
+
+fn warn_if_pid_fell_back(source: &SourceArgs, session: &CaptureSession) {
+    if source.pid.is_some() && session.mode() == CaptureMode::OutputLoopback {
+        eprintln!(
+            "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
+        );
+    }
 }
 
 fn write_transcript_events(
