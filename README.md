@@ -118,6 +118,7 @@ vapor-tap transcribe --funasr-url wss://asr.example.com/ws
 ```
 
 通过不受信任的网络访问远程服务时应使用 `wss://`。
+`wss://` 服务必须提供操作系统信任且与访问地址匹配的证书。Vapor Tap 不会跳过 TLS 证书校验；使用自签名证书时，应将签发它的 CA 安装到客户端系统的信任库，或在可信的反向代理上终止 TLS。
 
 ### macOS 权限与打包
 
@@ -137,7 +138,7 @@ macOS 可执行文件应放入已签名的应用包中，并在 `Info.plist` 中
 - Windows 10 build 19045：已在本机使用真实 Realtek 输出设备完成编译、单元测试和实际回环捕获，能够获取非静音 PCM；应用发现、`--app` 捕获以及不指定来源时的自动混音捕获均已验证。
 - Windows 11：代码已完成编译和单元测试，仍需在 Windows 11 真机上完成按 PID 捕获的最终验证。
 - macOS：已通过 `aarch64-apple-darwin` 目标交叉检查，权限弹窗和真实非零音频仍需在 macOS 14.2 或更高版本的真机上验证。
-- FunASR：WebSocket 协议已通过本地模拟服务测试；仍需使用实际 FunASR 模型服务进行端到端验证。
+- FunASR：已使用实际远程模型服务完成端到端验证，能够发送捕获的 PCM、接收在线及离线结果，并等待最终结束确认。测试服务使用不受系统信任的自签名证书，因此测试时通过临时 TLS 代理连接；直接使用 `wss://` 前仍需配置可信证书。
 
 ---
 
@@ -301,6 +302,10 @@ vapor-tap transcribe --app WeChat --funasr-url wss://asr.example.com/ws
 Use `wss://` over untrusted networks. A disconnect is reported explicitly and
 the command exits; restarting creates a new ASR session because the model cache
 from an interrupted WebSocket cannot be resumed safely.
+The certificate must be trusted by the client operating system and match the
+server address. Vapor Tap does not bypass TLS verification. For a self-signed
+certificate, install its issuing CA in the client trust store or terminate TLS
+at a trusted reverse proxy.
 
 ## Library API
 
@@ -374,3 +379,8 @@ whose `IsRunningOutput` property is true, exposing their PID and bundle ID.
 - macOS target: cross-compiled with `cargo check --target
   aarch64-apple-darwin`. Permission prompting and non-zero PCM require a macOS
   14.2+ machine for final validation.
+- FunASR: exercised end to end against a real remote model service, including
+  captured PCM upload, online and offline results, and the final end-of-input
+  acknowledgement. The test service used an untrusted self-signed certificate,
+  so a temporary TLS proxy was used; direct `wss://` access still requires a
+  trusted certificate.

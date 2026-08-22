@@ -8,7 +8,9 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::http::header::{
+    AUTHORIZATION, HeaderValue, SEC_WEBSOCKET_PROTOCOL,
+};
 
 use crate::audio::Pcm16Chunk;
 use crate::{Error, Result};
@@ -222,13 +224,25 @@ struct FinishMessage {
     is_end: bool,
 }
 
+fn deserialize_timestamp<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(timestamp)) => Some(timestamp),
+        Some(timestamp) => Some(timestamp.to_string()),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ServerMessage {
     #[serde(default)]
     mode: String,
     #[serde(default)]
     text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     timestamp: Option<String>,
     #[serde(default)]
     is_final: bool,
@@ -249,6 +263,9 @@ async fn run_connection(
         .as_str()
         .into_client_request()
         .map_err(|error| Error::Network(format!("invalid FunASR URL: {error}")))?;
+    request
+        .headers_mut()
+        .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("binary"));
     if let Some(token) = config.bearer_token.as_deref() {
         let value = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|error| Error::Network(format!("invalid bearer token: {error}")))?;
@@ -410,8 +427,26 @@ fn disconnected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    #[allow(clippy::result_large_err)]
+    async fn accept_funasr(stream: TcpStream) -> WebSocketStream<TcpStream> {
+        accept_hdr_async(stream, |request: &Request, mut response: Response| {
+            assert_eq!(
+                request.headers().get(SEC_WEBSOCKET_PROTOCOL),
+                Some(&HeaderValue::from_static("binary"))
+            );
+            response
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("binary"));
+            Ok(response)
+        })
+        .await
+        .unwrap()
+    }
 
     #[test]
     fn maps_online_and_offline_messages() {
@@ -460,7 +495,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
+            let mut socket = accept_funasr(stream).await;
 
             let Message::Text(start) = socket.next().await.unwrap().unwrap() else {
                 panic!("expected start JSON");
@@ -489,8 +524,7 @@ mod tests {
             assert_eq!(finish["is_end"], true);
             socket
                 .send(Message::Text(
-                    r#"{"mode":"2pass-offline","text":"hello.","is_final":true,"is_end":true}"#
-                        .into(),
+                    r#"{"mode":"2pass-offline","text":"hello.","timestamp":[[0,100]],"is_final":true,"is_end":true}"#.into(),
                 ))
                 .await
                 .unwrap();
@@ -516,10 +550,13 @@ mod tests {
             events.recv().await.unwrap(),
             TranscriptEvent::Partial { .. }
         ));
-        assert!(matches!(
+        assert_eq!(
             events.recv().await.unwrap(),
-            TranscriptEvent::Final { .. }
-        ));
+            TranscriptEvent::Final {
+                text: "hello.".into(),
+                timestamp: Some("[[0,100]]".into()),
+            }
+        );
         assert_eq!(events.recv().await.unwrap(), TranscriptEvent::End);
     }
 
@@ -529,7 +566,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
+            let mut socket = accept_funasr(stream).await;
 
             let Message::Text(_) = socket.next().await.unwrap().unwrap() else {
                 panic!("expected start JSON");

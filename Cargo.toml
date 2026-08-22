@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 flexaudio-core = "0.2"
