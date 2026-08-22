@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -182,7 +183,7 @@ fn capture_to_wav(args: CaptureArgs) -> Result<()> {
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(250));
-        let Ok(frame) = session.frames().recv_timeout(timeout) else {
+        let Some(frame) = receive_frame(&session, timeout)? else {
             continue;
         };
         let wav = match writer.as_mut() {
@@ -193,6 +194,7 @@ fn capture_to_wav(args: CaptureArgs) -> Result<()> {
         wav.write_frame(&frame)?;
     }
 
+    session.check_health()?;
     session.stop()?;
     if let Some(writer) = writer {
         writer.finish()?;
@@ -242,7 +244,7 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
             let timeout = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(250));
-            let Ok(frame) = session.frames().recv_timeout(timeout) else {
+            let Some(frame) = receive_frame(&session, timeout)? else {
                 continue;
             };
             if let Some(path) = save_audio.as_ref()
@@ -269,6 +271,7 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
                 sent_chunks += 1;
             }
         }
+        session.check_health()?;
         session.stop()?;
         if let Some(writer) = wav {
             writer.finish()?;
@@ -296,6 +299,28 @@ fn warn_if_process_fell_back(requested_process: bool, session: &CaptureSession) 
         eprintln!(
             "warning: Windows 10 does not support PID-isolated capture; capturing the complete default output mix"
         );
+    }
+}
+
+fn receive_frame(
+    session: &CaptureSession,
+    timeout: Duration,
+) -> Result<Option<vapor_tap::AudioFrame>> {
+    match session.frames().recv_timeout(timeout) {
+        Ok(frame) => {
+            session.check_health()?;
+            Ok(Some(frame))
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            session.check_health()?;
+            Ok(None)
+        }
+        Err(RecvTimeoutError::Disconnected) => match session.check_health() {
+            Err(error) => Err(error),
+            Ok(()) => Err(Error::Native(
+                "audio frame channel disconnected unexpectedly".into(),
+            )),
+        },
     }
 }
 

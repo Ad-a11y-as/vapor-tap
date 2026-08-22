@@ -307,16 +307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flexaudio-os-windows"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48042406e3a871f4b9b29b5251fe123ab699ed64f595fa38e6fbac2b1dbb1407"
-dependencies = [
- "flexaudio-core",
- "windows",
-]
-
-[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1072,7 +1062,6 @@ dependencies = [
  "block2",
  "clap",
  "flexaudio-core",
- "flexaudio-os-windows",
  "futures-util",
  "objc2",
  "objc2-core-audio",

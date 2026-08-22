@@ -219,6 +219,7 @@ struct StartMessage<'a> {
 #[derive(Serialize)]
 struct FinishMessage {
     is_speaking: bool,
+    is_end: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,7 +285,14 @@ async fn run_connection(
                             .map_err(|error| disconnected(&events, error.to_string()))?;
                     }
                     Some(InputMessage::Finish) | None => {
-                        send_json(&mut socket, &FinishMessage { is_speaking: false }).await?;
+                        send_json(
+                            &mut socket,
+                            &FinishMessage {
+                                is_speaking: false,
+                                is_end: true,
+                            },
+                        )
+                        .await?;
                         break;
                     }
                 }
@@ -356,7 +364,10 @@ fn emit_server_message(
     events: &mpsc::UnboundedSender<TranscriptEvent>,
 ) -> Result<bool> {
     if let Some(error) = message.error.filter(|error| !error.is_empty()) {
-        let _ = events.send(TranscriptEvent::ServerError { message: error });
+        let _ = events.send(TranscriptEvent::ServerError {
+            message: error.clone(),
+        });
+        return Err(Error::Protocol(format!("FunASR server error: {error}")));
     }
     if !message.text.is_empty() {
         let is_final =
@@ -372,6 +383,13 @@ fn emit_server_message(
         let _ = events.send(event);
     }
     if message.is_end {
+        if !message.is_final {
+            let message = "FunASR ended the session without a final acknowledgement".to_owned();
+            let _ = events.send(TranscriptEvent::ServerError {
+                message: message.clone(),
+            });
+            return Err(Error::Protocol(message));
+        }
         let _ = events.send(TranscriptEvent::End);
         return Ok(true);
     }
@@ -415,7 +433,7 @@ mod tests {
                 mode: "2pass-offline".into(),
                 text: "最终。".into(),
                 timestamp: Some("[[0,100]]".into()),
-                is_final: false,
+                is_final: true,
                 is_end: true,
                 error: None,
             },
@@ -468,9 +486,11 @@ mod tests {
             };
             let finish: serde_json::Value = serde_json::from_str(finish.as_ref()).unwrap();
             assert_eq!(finish["is_speaking"], false);
+            assert_eq!(finish["is_end"], true);
             socket
                 .send(Message::Text(
-                    r#"{"mode":"2pass-offline","text":"hello.","is_end":true}"#.into(),
+                    r#"{"mode":"2pass-offline","text":"hello.","is_final":true,"is_end":true}"#
+                        .into(),
                 ))
                 .await
                 .unwrap();
@@ -501,5 +521,50 @@ mod tests {
             TranscriptEvent::Final { .. }
         ));
         assert_eq!(events.recv().await.unwrap(), TranscriptEvent::End);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_failed_end_of_input_acknowledgement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+
+            let Message::Text(_) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected start JSON");
+            };
+            let Message::Text(finish) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected finish JSON");
+            };
+            let finish: serde_json::Value = serde_json::from_str(finish.as_ref()).unwrap();
+            assert_eq!(finish["is_speaking"], false);
+            assert_eq!(finish["is_end"], true);
+
+            socket
+                .send(Message::Text(
+                    r#"{"is_end":true,"is_final":false,"error":"model failed"}"#.into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut config = FunAsrConfig::new(format!("ws://{address}"));
+        config.connect_timeout = Duration::from_secs(2);
+        config.final_result_timeout = Duration::from_secs(2);
+        let mut client = FunAsrClient::connect(config).await.unwrap();
+        let mut events = client.take_events().unwrap();
+
+        let error = client.finish().await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, Error::Protocol(message) if message.contains("model failed")));
+        assert_eq!(
+            events.recv().await.unwrap(),
+            TranscriptEvent::ServerError {
+                message: "model failed".into()
+            }
+        );
+        assert!(events.recv().await.is_none());
     }
 }

@@ -14,7 +14,7 @@ mod wav;
 pub use error::{Error, Result};
 pub use wav::WavWriter;
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// Audio format shared by all frames in a capture session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,7 +202,9 @@ fn resolve_audio_application_from(
 pub struct CaptureSession {
     inner: platform::PlatformSession,
     receiver: Receiver<AudioFrame>,
+    runtime_errors: Receiver<Error>,
     mode: CaptureMode,
+    stopped: bool,
 }
 
 impl CaptureSession {
@@ -222,11 +224,13 @@ impl CaptureSession {
             return Err(Error::InvalidArgument("channel_capacity must be non-zero"));
         }
 
-        let (inner, receiver, mode) = platform::start(config)?;
+        let (inner, receiver, runtime_errors, mode) = platform::start(config)?;
         Ok(Self {
             inner,
             receiver,
+            runtime_errors,
             mode,
+            stopped: false,
         })
     }
 
@@ -241,8 +245,32 @@ impl CaptureSession {
         self.mode
     }
 
+    /// Reports a native capture failure that happened after startup.
+    ///
+    /// Consumers should call this after a frame receive timeout or channel
+    /// disconnection so backend failure is not mistaken for silence.
+    pub fn check_health(&self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        match self.runtime_errors.try_recv() {
+            Ok(error) => Err(error),
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => Err(Error::Native(
+                "native capture worker stopped unexpectedly".into(),
+            )),
+        }
+    }
+
     pub fn stop(&mut self) -> Result<()> {
-        self.inner.stop()
+        if self.stopped {
+            return Ok(());
+        }
+        let health = self.check_health();
+        let stop = self.inner.stop();
+        self.stopped = true;
+        health?;
+        stop
     }
 }
 

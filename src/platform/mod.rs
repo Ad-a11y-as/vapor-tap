@@ -32,7 +32,12 @@ mod unsupported {
 
     pub(crate) fn start(
         _: CaptureConfig,
-    ) -> Result<(PlatformSession, Receiver<AudioFrame>, CaptureMode)> {
+    ) -> Result<(
+        PlatformSession,
+        Receiver<AudioFrame>,
+        Receiver<Error>,
+        CaptureMode,
+    )> {
         Err(Error::UnsupportedPlatform(
             "vapor-tap supports Windows 10+ and macOS 14.2+",
         ))

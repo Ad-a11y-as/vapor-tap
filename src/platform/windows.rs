@@ -8,7 +8,6 @@ use std::time::Duration;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::raw_ring;
 use flexaudio_core::types::ProcessMode;
-use flexaudio_os_windows::{WasapiProcessBackend, WasapiSystemBackend};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{
@@ -29,6 +28,10 @@ use crate::{
     OutputDevice, Result,
 };
 
+#[path = "windows_backend/mod.rs"]
+mod windows_backend;
+use windows_backend::{WasapiProcessBackend, WasapiSystemBackend};
+
 pub(crate) struct PlatformSession {
     backend: Box<dyn CaptureBackend>,
     stop: Arc<AtomicBool>,
@@ -38,20 +41,32 @@ pub(crate) struct PlatformSession {
 
 pub(crate) fn start(
     config: CaptureConfig,
-) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>, CaptureMode)> {
-    let (mut backend, mode): (Box<dyn CaptureBackend>, CaptureMode) = match config.source {
-        CaptureSource::Process { pid } if windows_build()? >= 20_348 => (
-            Box::new(WasapiProcessBackend::new(pid, ProcessMode::Include)),
-            CaptureMode::ProcessLoopback,
-        ),
-        CaptureSource::Process { .. } => (
-            Box::new(WasapiSystemBackend::new(false, None)),
-            CaptureMode::OutputLoopback,
-        ),
-        CaptureSource::OutputDevice { name } => (
-            Box::new(WasapiSystemBackend::new(false, name)),
-            CaptureMode::OutputLoopback,
-        ),
+) -> Result<(
+    PlatformSession,
+    mpsc::Receiver<AudioFrame>,
+    mpsc::Receiver<Error>,
+    CaptureMode,
+)> {
+    let (mut backend, backend_terminated, mode): (
+        Box<dyn CaptureBackend>,
+        Arc<AtomicBool>,
+        CaptureMode,
+    ) = match config.source {
+        CaptureSource::Process { pid } if windows_build()? >= 20_348 => {
+            let backend = WasapiProcessBackend::new(pid, ProcessMode::Include);
+            let terminated = backend.termination_flag();
+            (Box::new(backend), terminated, CaptureMode::ProcessLoopback)
+        }
+        CaptureSource::Process { .. } => {
+            let backend = WasapiSystemBackend::new(false, None);
+            let terminated = backend.termination_flag();
+            (Box::new(backend), terminated, CaptureMode::OutputLoopback)
+        }
+        CaptureSource::OutputDevice { name } => {
+            let backend = WasapiSystemBackend::new(false, name);
+            let terminated = backend.termination_flag();
+            (Box::new(backend), terminated, CaptureMode::OutputLoopback)
+        }
     };
     let (sample_rate, channels) = backend.native_format();
     let format = AudioFormat {
@@ -66,6 +81,7 @@ pub(crate) fn start(
         .map_err(|error| Error::Native(error.to_string()))?;
 
     let (sender, receiver) = mpsc::sync_channel(config.channel_capacity);
+    let (runtime_error_sender, runtime_error_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let drain_stop = Arc::clone(&stop);
     let drain = thread::Builder::new()
@@ -75,6 +91,14 @@ pub(crate) fn start(
             let mut samples = vec![0.0; packet_samples];
             while !drain_stop.load(Ordering::Acquire) {
                 if consumer.available() < packet_samples {
+                    if backend_terminated.load(Ordering::Acquire) {
+                        if !drain_stop.load(Ordering::Acquire) {
+                            let _ = runtime_error_sender.try_send(Error::Native(
+                                "Windows audio capture backend stopped unexpectedly".into(),
+                            ));
+                        }
+                        break;
+                    }
                     thread::sleep(Duration::from_millis(2));
                     continue;
                 }
@@ -84,7 +108,10 @@ pub(crate) fn start(
                         format,
                         samples: samples.clone(),
                     };
-                    let _ = sender.try_send(frame);
+                    match sender.try_send(frame) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
             }
         })
@@ -98,6 +125,7 @@ pub(crate) fn start(
             stopped: false,
         },
         receiver,
+        runtime_error_receiver,
         mode,
     ))
 }
@@ -144,7 +172,7 @@ pub(crate) fn process_isolation_supported() -> Result<bool> {
 }
 
 pub(crate) fn list_output_devices() -> Result<Vec<OutputDevice>> {
-    flexaudio_os_windows::list_output_devices()
+    windows_backend::list_output_devices()
         .map(|devices| {
             devices
                 .into_iter()
@@ -297,8 +325,8 @@ impl PlatformSession {
         if self.stopped {
             return Ok(());
         }
-        self.backend.stop();
         self.stop.store(true, Ordering::Release);
+        self.backend.stop();
         if let Some(drain) = self.drain.take() {
             drain
                 .join()

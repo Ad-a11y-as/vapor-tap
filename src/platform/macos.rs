@@ -93,7 +93,12 @@ pub(crate) struct PlatformSession {
 
 pub(crate) fn start(
     config: CaptureConfig,
-) -> Result<(PlatformSession, mpsc::Receiver<AudioFrame>, CaptureMode)> {
+) -> Result<(
+    PlatformSession,
+    mpsc::Receiver<AudioFrame>,
+    mpsc::Receiver<Error>,
+    CaptureMode,
+)> {
     ensure_supported_version()?;
     let pid = match config.source {
         CaptureSource::Process { pid } => pid,
@@ -106,8 +111,10 @@ pub(crate) fn start(
     let (producer, mut consumer) = raw_ring(48_000 * 2 * 2);
     let sink = RawSink::new(producer, 48_000, 2);
     let (sender, receiver) = mpsc::sync_channel(config.channel_capacity);
+    let (runtime_error_sender, runtime_error_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let tap_runtime_errors = runtime_error_sender.clone();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
 
     let handle = thread::Builder::new()
@@ -115,7 +122,12 @@ pub(crate) fn start(
         .spawn(move || {
             let result = (|| unsafe {
                 let process_object = translate_pid(pid)?;
-                let (chain, format) = build_tap_chain(process_object, sink)?;
+                let (chain, format) = build_tap_chain(
+                    process_object,
+                    sink,
+                    Arc::clone(&thread_stop),
+                    tap_runtime_errors,
+                )?;
                 let _ = ready_sender.send(Ok(format));
                 while !thread_stop.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(10));
@@ -144,10 +156,14 @@ pub(crate) fn start(
                             continue;
                         }
                         if consumer.pop_slice(&mut samples) == packet_samples {
-                            let _ = sender.try_send(AudioFrame {
+                            let frame = AudioFrame {
                                 format,
                                 samples: samples.clone(),
-                            });
+                            };
+                            match sender.try_send(frame) {
+                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                            }
                         }
                     }
                 }) {
@@ -166,6 +182,7 @@ pub(crate) fn start(
                     stopped: false,
                 },
                 receiver,
+                runtime_error_receiver,
                 CaptureMode::ProcessLoopback,
             ))
         }
@@ -341,6 +358,8 @@ unsafe fn translate_pid(pid: u32) -> Result<AudioObjectID> {
 unsafe fn build_tap_chain(
     process_object: AudioObjectID,
     sink: RawSink,
+    callback_stopped: Arc<AtomicBool>,
+    runtime_errors: mpsc::SyncSender<Error>,
 ) -> Result<(TapChain, AudioFormat)> {
     let process_number = NSNumber::numberWithUnsignedInt(process_object);
     let processes = NSArray::from_retained_slice(&[process_number]);
@@ -374,7 +393,6 @@ unsafe fn build_tap_chain(
         }
     };
 
-    let callback_stopped = Arc::new(AtomicBool::new(false));
     let stopped_for_block = Arc::clone(&callback_stopped);
     let sink = RefCell::new(sink);
     let scratch_capacity = format.sample_rate as usize * usize::from(format.channels) / 2;
@@ -385,7 +403,7 @@ unsafe fn build_tap_chain(
               _input_time: NonNull<AudioTimeStamp>,
               _output: NonNull<AudioBufferList>,
               _output_time: NonNull<AudioTimeStamp>| {
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            let result = catch_unwind(AssertUnwindSafe(|| {
                 if stopped_for_block.load(Ordering::Acquire) {
                     return;
                 }
@@ -398,6 +416,11 @@ unsafe fn build_tap_chain(
                     }
                 }
             }));
+            if result.is_err() {
+                stopped_for_block.store(true, Ordering::Release);
+                let _ = runtime_errors
+                    .try_send(Error::Native("Core Audio capture callback panicked".into()));
+            }
         },
     );
 
