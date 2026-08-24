@@ -36,9 +36,9 @@ enum Command {
 struct CaptureArgs {
     #[command(flatten)]
     source: SourceArgs,
-    /// Capture duration in seconds.
-    #[arg(long, default_value_t = 10)]
-    seconds: u64,
+    /// Optional capture duration in seconds. Omit to run until Ctrl+C.
+    #[arg(long)]
+    seconds: Option<u64>,
     /// Destination IEEE-float WAV file.
     #[arg(long, default_value = "capture.wav")]
     output: PathBuf,
@@ -167,28 +167,60 @@ async fn main() {
 async fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Apps => print_audio_applications(&list_audio_applications()?),
-        Command::Capture(args) => {
-            tokio::task::spawn_blocking(move || capture_to_wav(args))
-                .await
-                .map_err(|error| Error::Native(format!("capture task failed: {error}")))??;
-        }
+        Command::Capture(args) => capture(args).await?,
         Command::Transcribe(args) => transcribe(args).await?,
     }
     Ok(())
 }
 
-fn capture_to_wav(args: CaptureArgs) -> Result<()> {
+async fn capture(args: CaptureArgs) -> Result<()> {
+    let runs_continuously = args.seconds.is_none();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let capture_stop_requested = Arc::clone(&stop_requested);
+    // Keep the Windows listener alive until the WAV writer has finalized. If
+    // the listener is dropped immediately after receiving Ctrl+C, Windows can
+    // delegate a repeated signal to its default terminating handler.
+    let mut ctrl_c = CtrlCSignal::new()?;
+    let mut capture_task =
+        tokio::task::spawn_blocking(move || capture_to_wav(args, capture_stop_requested));
+
+    if runs_continuously {
+        eprintln!("capturing continuously; press Ctrl+C to stop and finalize the WAV file");
+    }
+    let capture_join = tokio::select! {
+        result = &mut capture_task => result,
+        signal = ctrl_c.recv() => {
+            if let Err(error) = signal {
+                stop_requested.store(true, Ordering::Release);
+                let _ = capture_task.await;
+                return Err(Error::Io(error));
+            }
+            eprintln!("Ctrl+C received; stopping capture and finalizing the WAV file");
+            stop_requested.store(true, Ordering::Release);
+            capture_task.await
+        }
+    };
+
+    capture_join.map_err(|error| Error::Native(format!("capture task failed: {error}")))?
+}
+
+fn capture_to_wav(args: CaptureArgs, stop_requested: Arc<AtomicBool>) -> Result<()> {
     let config = args.source.capture_config()?;
     let requested_process = matches!(config.source, CaptureSource::Process { .. });
     let mut session = CaptureSession::start(config)?;
     warn_if_process_fell_back(requested_process, &session);
-    let deadline = Instant::now() + Duration::from_secs(args.seconds);
+    let deadline = args
+        .seconds
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut writer = None;
     let mut sample_frames = 0_u64;
 
-    while Instant::now() < deadline {
+    while !stop_requested.load(Ordering::Acquire)
+        && deadline.is_none_or(|deadline| Instant::now() < deadline)
+    {
         let timeout = deadline
-            .saturating_duration_since(Instant::now())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(250))
             .min(Duration::from_millis(250));
         let Some(frame) = receive_frame(&session, timeout)? else {
             continue;
@@ -477,6 +509,26 @@ mod tests {
 
         let Command::Transcribe(args) = cli.command else {
             panic!("expected transcribe command");
+        };
+        assert_eq!(args.seconds, Some(60));
+    }
+
+    #[test]
+    fn capture_runs_until_ctrl_c_when_seconds_are_omitted() {
+        let cli = Cli::try_parse_from(["vapor-tap", "capture"]).unwrap();
+
+        let Command::Capture(args) = cli.command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(args.seconds, None);
+    }
+
+    #[test]
+    fn capture_accepts_an_optional_fixed_duration() {
+        let cli = Cli::try_parse_from(["vapor-tap", "capture", "--seconds", "60"]).unwrap();
+
+        let Command::Capture(args) = cli.command else {
+            panic!("expected capture command");
         };
         assert_eq!(args.seconds, Some(60));
     }

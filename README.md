@@ -46,8 +46,10 @@ cargo build --release
 先在微信、浏览器、视频播放器或其他目标应用中开始播放声音。仅捕获音频并保存为 WAV 时，不需要 FunASR：
 
 ```shell
-vapor-tap capture --seconds 10 --output capture.wav
+vapor-tap capture --output capture.wav
 ```
+
+不指定 `--seconds` 时，录音会持续运行。按一次 `Ctrl+C` 后，Vapor Tap 会停止捕获、刷新 WAV 数据并安全写入文件头，然后正常退出。需要固定时长时可增加 `--seconds 60`；定时录音也可以按 `Ctrl+C` 提前安全结束。
 
 Windows 10、Windows 11 和 macOS 都会在未指定来源时直接捕获系统音频，不显示应用选择菜单。系统通知和其他应用的声音也会被包含；需要隔离时再指定应用。
 
@@ -203,9 +205,15 @@ platform captures system-wide output audio without showing an application
 picker:
 
 ```shell
-vapor-tap capture --seconds 10 --output capture.wav
+vapor-tap capture --output capture.wav
 vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
 ```
+
+When `--seconds` is omitted, recording continues until you press `Ctrl+C`.
+Vapor Tap then stops capture, flushes the samples, finalizes the WAV header, and
+exits normally. Add a value such as `--seconds 60` for a fixed-duration run; a
+timed recording can also be ended early with `Ctrl+C` without corrupting the
+WAV file.
 
 To isolate an application on Windows 11 or macOS, list active applications and
 select one by name; users do not need to find a PID:
