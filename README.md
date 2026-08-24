@@ -94,7 +94,6 @@ vapor-tap transcribe \
   --app WeChat \
   --funasr-url wss://asr.example.com/ws \
   --mode two-pass \
-  --text-output transcript.txt \
   --json-output transcript.jsonl
 ```
 
@@ -102,7 +101,7 @@ vapor-tap transcribe \
 
 发送给 FunASR 前，音频会在工作线程中转换为单声道、16 kHz、有符号 PCM16 小端格式，并以 60 毫秒的二进制消息发送。默认识别模式为 `two-pass`：在线结果作为临时文本输出，`2pass-offline` 结果作为最终文本追加。
 
-`--text-output` 保存纯文本，`--json-output` 保存 JSONL 事件流。JSONL 会区分 `partial`、`final`、`server_error` 和 `disconnected` 事件。连接断开时命令会明确报错并退出，重新启动命令会创建新的识别会话。
+不指定 `--text-output` 时，最终识别文字会以本地时间自动保存为 `transcript-YYYYMMDD-HHMMSS.txt`，位置是执行命令时的当前目录，完成后会打印完整路径。可使用 `--text-output records\meeting.txt` 自定义文件名或路径。`--json-output` 仍是可选的 JSONL 事件流，会区分 `partial`、`final`、`server_error` 和 `disconnected` 事件。连接断开时命令会明确报错并退出，重新启动命令会创建新的识别会话。
 
 如果服务需要 Bearer Token，请通过环境变量传入，避免令牌出现在命令行历史中：
 
@@ -256,7 +255,6 @@ vapor-tap transcribe \
   --app WeChat \
   --funasr-url wss://asr.example.com/ws \
   --mode two-pass \
-  --text-output transcript.txt \
   --json-output transcript.jsonl
 ```
 
@@ -266,6 +264,11 @@ FunASR result, and then flushes and closes the text, JSONL, and optional WAV
 files. Use a value such as `--seconds 60` for unattended fixed-duration runs.
 `Ctrl+C` can also end a timed run early while preserving the same graceful
 shutdown sequence.
+
+When `--text-output` is omitted, final recognition text is saved in the current
+working directory as `transcript-YYYYMMDD-HHMMSS.txt` using local time. The
+complete path is printed on completion. Use a value such as
+`--text-output records/meeting.txt` to choose a different name or location.
 
 For the standard FunASR runtime whose WebSocket is directly exposed on port
 10095, a local development command typically looks like:

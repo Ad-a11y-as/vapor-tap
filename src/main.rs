@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -64,7 +64,7 @@ struct TranscribeArgs {
     /// Environment variable containing the bearer token. The token is not exposed in argv.
     #[arg(long, default_value = "VAPOR_TAP_FUNASR_TOKEN")]
     bearer_token_env: String,
-    /// Write final sentences to this UTF-8 text file.
+    /// Destination text file. Defaults to transcript-YYYYMMDD-HHMMSS.txt.
     #[arg(long)]
     text_output: Option<PathBuf>,
     /// Write partial/final/error events to this JSON Lines file.
@@ -206,10 +206,11 @@ async fn capture(args: CaptureArgs) -> Result<()> {
     capture_join.map_err(|error| Error::Native(format!("capture task failed: {error}")))?
 }
 
-fn resolve_capture_output(output: Option<&std::path::Path>) -> Result<PathBuf> {
-    let output = output
-        .map(PathBuf::from)
-        .unwrap_or_else(timestamped_capture_filename);
+fn resolve_output(
+    output: Option<&Path>,
+    default_filename: impl FnOnce() -> PathBuf,
+) -> Result<PathBuf> {
+    let output = output.map(PathBuf::from).unwrap_or_else(default_filename);
     if output.is_absolute() {
         Ok(output)
     } else {
@@ -217,10 +218,28 @@ fn resolve_capture_output(output: Option<&std::path::Path>) -> Result<PathBuf> {
     }
 }
 
+fn resolve_capture_output(output: Option<&Path>) -> Result<PathBuf> {
+    resolve_output(output, timestamped_capture_filename)
+}
+
+fn resolve_transcript_output(output: Option<&Path>) -> Result<PathBuf> {
+    resolve_output(output, timestamped_transcript_filename)
+}
+
 fn timestamped_capture_filename() -> PathBuf {
+    timestamped_filename("captured", "wav")
+}
+
+fn timestamped_transcript_filename() -> PathBuf {
+    timestamped_filename("transcript", "txt")
+}
+
+fn timestamped_filename(prefix: &str, extension: &str) -> PathBuf {
     PathBuf::from(format!(
-        "captured-{}.wav",
-        Local::now().format("%Y%m%d-%H%M%S")
+        "{}-{}.{}",
+        prefix,
+        Local::now().format("%Y%m%d-%H%M%S"),
+        extension
     ))
 }
 
@@ -270,6 +289,8 @@ fn capture_to_wav(
 }
 
 async fn transcribe(args: TranscribeArgs) -> Result<()> {
+    let text_output = resolve_transcript_output(args.text_output.as_deref())?;
+    let reported_text_output = text_output.clone();
     let capture_config = args.source.capture_config()?;
     let requested_process = matches!(capture_config.source, CaptureSource::Process { .. });
     let mut config = FunAsrConfig::new(&args.funasr_url);
@@ -283,10 +304,9 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     let mut client = FunAsrClient::connect(config).await?;
     let input = client.input();
     let events = client.take_events()?;
-    let text_output = args.text_output.clone();
     let json_output = args.json_output.clone();
     let event_task = tokio::task::spawn_blocking(move || {
-        write_transcript_events(events, text_output, json_output)
+        write_transcript_events(events, Some(text_output), json_output)
     });
 
     let seconds = args.seconds;
@@ -378,6 +398,7 @@ async fn transcribe(args: TranscribeArgs) -> Result<()> {
     finish_result?;
     event_result?;
     println!("sent {sent_chunks} audio chunks to FunASR");
+    println!("transcript saved to {}", reported_text_output.display());
     Ok(())
 }
 
@@ -584,6 +605,41 @@ mod tests {
     fn relative_capture_output_resolves_from_the_current_directory() {
         let output = resolve_capture_output(Some(std::path::Path::new("named.wav"))).unwrap();
         assert_eq!(output, std::env::current_dir().unwrap().join("named.wav"));
+    }
+
+    #[test]
+    fn transcript_output_is_optional() {
+        let cli = Cli::try_parse_from([
+            "vapor-tap",
+            "transcribe",
+            "--funasr-url",
+            "ws://127.0.0.1:10095",
+        ])
+        .unwrap();
+
+        let Command::Transcribe(args) = cli.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(args.text_output, None);
+    }
+
+    #[test]
+    fn timestamped_transcript_filename_has_the_documented_shape() {
+        let path = timestamped_transcript_filename();
+        let name = path.to_str().unwrap();
+
+        assert_eq!(name.len(), 30);
+        assert!(name.starts_with("transcript-"));
+        assert!(name.ends_with(".txt"));
+        assert_eq!(&name[19..20], "-");
+        assert!(name[11..19].bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(name[20..26].bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[test]
+    fn relative_transcript_output_resolves_from_the_current_directory() {
+        let output = resolve_transcript_output(Some(Path::new("named.txt"))).unwrap();
+        assert_eq!(output, std::env::current_dir().unwrap().join("named.txt"));
     }
 
     #[test]
