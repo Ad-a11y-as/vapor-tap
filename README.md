@@ -46,10 +46,12 @@ cargo build --release
 先在微信、浏览器、视频播放器或其他目标应用中开始播放声音。仅捕获音频并保存为 WAV 时，不需要 FunASR：
 
 ```shell
-vapor-tap capture --output capture.wav
+vapor-tap capture
 ```
 
 不指定 `--seconds` 时，录音会持续运行。按一次 `Ctrl+C` 后，Vapor Tap 会停止捕获、刷新 WAV 数据并安全写入文件头，然后正常退出。需要固定时长时可增加 `--seconds 60`；定时录音也可以按 `Ctrl+C` 提前安全结束。
+
+不指定 `--output` 时，文件会以本地时间自动命名为 `captured-YYYYMMDD-HHMMSS.wav`，保存在执行命令时的当前目录中；命令结束时会打印完整路径。例如，在 `E:\workspace\vapor-tap` 中执行，可能生成 `E:\workspace\vapor-tap\captured-20260824-153045.wav`。仍可使用 `--output recordings\meeting.wav` 指定文件名或路径。
 
 Windows 10、Windows 11 和 macOS 都会在未指定来源时直接捕获系统音频，不显示应用选择菜单。系统通知和其他应用的声音也会被包含；需要隔离时再指定应用。
 
@@ -205,7 +207,7 @@ platform captures system-wide output audio without showing an application
 picker:
 
 ```shell
-vapor-tap capture --output capture.wav
+vapor-tap capture
 vapor-tap transcribe --funasr-url ws://127.0.0.1:10095
 ```
 
@@ -214,6 +216,11 @@ Vapor Tap then stops capture, flushes the samples, finalizes the WAV header, and
 exits normally. Add a value such as `--seconds 60` for a fixed-duration run; a
 timed recording can also be ended early with `Ctrl+C` without corrupting the
 WAV file.
+
+When `--output` is omitted, the file uses the local-time name
+`captured-YYYYMMDD-HHMMSS.wav` in the command's current working directory. The
+complete path is printed when capture finishes. You can still provide a name or
+path such as `--output recordings/meeting.wav`.
 
 To isolate an application on Windows 11 or macOS, list active applications and
 select one by name; users do not need to find a PID:

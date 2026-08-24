@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use vapor_tap::asr::{AsrMode, FunAsrClient, FunAsrConfig, FunAsrEventReceiver, TranscriptEvent};
@@ -39,9 +40,9 @@ struct CaptureArgs {
     /// Optional capture duration in seconds. Omit to run until Ctrl+C.
     #[arg(long)]
     seconds: Option<u64>,
-    /// Destination IEEE-float WAV file.
-    #[arg(long, default_value = "capture.wav")]
-    output: PathBuf,
+    /// Destination WAV file. Defaults to captured-YYYYMMDD-HHMMSS.wav.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -175,6 +176,7 @@ async fn run() -> Result<()> {
 
 async fn capture(args: CaptureArgs) -> Result<()> {
     let runs_continuously = args.seconds.is_none();
+    let output = resolve_capture_output(args.output.as_deref())?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let capture_stop_requested = Arc::clone(&stop_requested);
     // Keep the Windows listener alive until the WAV writer has finalized. If
@@ -182,7 +184,7 @@ async fn capture(args: CaptureArgs) -> Result<()> {
     // delegate a repeated signal to its default terminating handler.
     let mut ctrl_c = CtrlCSignal::new()?;
     let mut capture_task =
-        tokio::task::spawn_blocking(move || capture_to_wav(args, capture_stop_requested));
+        tokio::task::spawn_blocking(move || capture_to_wav(args, output, capture_stop_requested));
 
     if runs_continuously {
         eprintln!("capturing continuously; press Ctrl+C to stop and finalize the WAV file");
@@ -204,7 +206,29 @@ async fn capture(args: CaptureArgs) -> Result<()> {
     capture_join.map_err(|error| Error::Native(format!("capture task failed: {error}")))?
 }
 
-fn capture_to_wav(args: CaptureArgs, stop_requested: Arc<AtomicBool>) -> Result<()> {
+fn resolve_capture_output(output: Option<&std::path::Path>) -> Result<PathBuf> {
+    let output = output
+        .map(PathBuf::from)
+        .unwrap_or_else(timestamped_capture_filename);
+    if output.is_absolute() {
+        Ok(output)
+    } else {
+        Ok(std::env::current_dir()?.join(output))
+    }
+}
+
+fn timestamped_capture_filename() -> PathBuf {
+    PathBuf::from(format!(
+        "captured-{}.wav",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ))
+}
+
+fn capture_to_wav(
+    args: CaptureArgs,
+    output: PathBuf,
+    stop_requested: Arc<AtomicBool>,
+) -> Result<()> {
     let config = args.source.capture_config()?;
     let requested_process = matches!(config.source, CaptureSource::Process { .. });
     let mut session = CaptureSession::start(config)?;
@@ -227,7 +251,7 @@ fn capture_to_wav(args: CaptureArgs, stop_requested: Arc<AtomicBool>) -> Result<
         };
         let wav = match writer.as_mut() {
             Some(wav) => wav,
-            None => writer.insert(WavWriter::create(&args.output, frame.format)?),
+            None => writer.insert(WavWriter::create(&output, frame.format)?),
         };
         sample_frames += frame.frame_count() as u64;
         wav.write_frame(&frame)?;
@@ -240,7 +264,7 @@ fn capture_to_wav(args: CaptureArgs, stop_requested: Arc<AtomicBool>) -> Result<
     }
     println!(
         "captured {sample_frames} sample frames to {}",
-        args.output.display()
+        output.display()
     );
     Ok(())
 }
@@ -531,6 +555,35 @@ mod tests {
             panic!("expected capture command");
         };
         assert_eq!(args.seconds, Some(60));
+    }
+
+    #[test]
+    fn capture_output_is_optional() {
+        let cli = Cli::try_parse_from(["vapor-tap", "capture"]).unwrap();
+
+        let Command::Capture(args) = cli.command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(args.output, None);
+    }
+
+    #[test]
+    fn timestamped_capture_filename_has_the_documented_shape() {
+        let path = timestamped_capture_filename();
+        let name = path.to_str().unwrap();
+
+        assert_eq!(name.len(), 28);
+        assert!(name.starts_with("captured-"));
+        assert!(name.ends_with(".wav"));
+        assert_eq!(&name[17..18], "-");
+        assert!(name[9..17].bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(name[18..24].bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[test]
+    fn relative_capture_output_resolves_from_the_current_directory() {
+        let output = resolve_capture_output(Some(std::path::Path::new("named.wav"))).unwrap();
+        assert_eq!(output, std::env::current_dir().unwrap().join("named.wav"));
     }
 
     #[test]
