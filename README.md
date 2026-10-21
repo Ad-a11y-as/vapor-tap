@@ -170,6 +170,41 @@ server address. Vapor Tap does not bypass TLS verification. For a self-signed
 certificate, install its issuing CA in the client trust store or terminate TLS
 at a trusted reverse proxy.
 
+## FunASR hardware requirements
+
+The `funasr-runtime-sdk-online-cpu` service used by this project does not
+require a GPU. FunASR's
+[official realtime deployment guide](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_tutorial_online_zh.md)
+lists the following recommended x86 compute-server configurations:
+
+| CPU | Memory | Approximate concurrent sessions |
+| --- | ---: | ---: |
+| 4 vCPU cores | 8 GB | 16 |
+| 16 vCPU cores | 32 GB | 32 |
+| 64 vCPU cores | 128 GB | 100 |
+
+These are recommended sizing points and approximate capacity figures, not hard
+minimum requirements. Actual capacity depends on CPU performance, model choice,
+audio workload, and thread settings. For one Vapor Tap transcription stream, a
+Linux host with 4 CPU cores and 8 GB of memory is a practical starting point;
+8 cores and 16 GB or more are preferable for multiple streams or continuous
+production use.
+
+The current CPU image supports AMD64 and ARM64, although the published capacity
+figures above are for x86 servers. The convenience deployment script supports
+Linux; Windows and macOS can run Vapor Tap and connect to a FunASR service on a
+Linux host or Linux container. The official documentation does not publish a
+fixed disk-space minimum. As a planning allowance, reserve at least 15–20 GB
+for the Docker image, the offline and streaming ASR models, VAD, punctuation,
+language-model and ITN assets, and logs, then confirm the actual size of the
+downloaded files.
+
+The server derives decoder and I/O thread counts from the available CPU by
+default. When tuning manually, FunASR recommends keeping
+`decoder-thread-num × model-thread-num` close to the total CPU thread count.
+GPU-based FunASR runtimes have separate model-specific CUDA and VRAM
+requirements and are not required for this integration.
+
 ## Optional air-gapped FunASR installation
 
 Here, *air-gapped installation* means deploying FunASR on a machine without
@@ -187,34 +222,87 @@ version follows the
 [official FunASR realtime service guide](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_advanced_guide_online.md).
 Prepare both the image and models again when upgrading it.
 
-On an Internet-connected staging machine, pull the image and start the server
-once so that every model is downloaded:
+### 1. Download the image and models on a connected machine
+
+Pull the pinned image, create the host model directory, and open a shell in a
+temporary staging container. This command opens Bash; it does not start the
+FunASR service by itself:
 
 ```shell
 FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
 
 mkdir -p funasr-airgap/models
 docker pull "$FUNASR_IMAGE"
-docker run --rm -it --entrypoint bash -p 10095:10095 \
+docker run --rm -it --name funasr-prefetch \
+  --entrypoint bash -p 10095:10095 \
   -v "$PWD/funasr-airgap/models:/workspace/models" \
   "$FUNASR_IMAGE"
 ```
 
-Inside the container, run:
+Inside the container, start the service with an explicit model list. Using the
+same list here and on the offline machine prevents the image defaults from
+silently selecting a different model set:
 
 ```shell
 cd /workspace/FunASR/runtime
-bash run_server_2pass.sh \
+. ./run_server_2pass.sh \
   --download-model-dir /workspace/models \
-  --certfile 0 >log.txt 2>&1
-tail -f log.txt
+  --model-dir damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  --online-model-dir damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  --vad-dir damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  --punc-dir damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  --lm-dir damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  --itn-dir thuduj12/fst_itn_zh \
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
 ```
 
-Wait until the log shows that all models are loaded and the server is
-listening on port `10095`. In another terminal, confirm that
-`funasr-airgap/models` is not empty. Press `Ctrl+C` to stop following the log,
-then exit the container. The models are stored on the host and are not removed
-by `--rm`. Package the image and models with checksums:
+The official script starts the server as a background process. Sourcing it
+keeps that process attached to the current shell, while `wait` keeps the
+container running and displays the server logs directly in the terminal.
+
+### 2. Verify and package the offline bundle
+
+Leave the staging container running. In another terminal on the connected
+machine, verify that every required model directory exists:
+
+```shell
+for model in \
+  damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  thuduj12/fst_itn_zh
+do
+  test -d "funasr-airgap/models/$model" || {
+    echo "missing model directory: $model"
+    exit 1
+  }
+done
+echo "all required model directories are present"
+```
+
+Wait until the service log reports no download or model-loading errors and port
+`10095` is listening. Play some speech audio and run one end-to-end test from a
+machine that can reach the staging server:
+
+```shell
+vapor-tap transcribe --funasr-url ws://127.0.0.1:10095 --seconds 10
+```
+
+Replace `127.0.0.1` with the staging server address when Vapor Tap runs on
+another machine. After a successful test, stop the temporary container from the
+second terminal:
+
+```shell
+docker stop funasr-prefetch
+```
+
+Because the model directory is mounted from the host, `--rm` removes only the
+temporary container. Package the pinned image, verified models, and checksums:
 
 ```shell
 docker save -o funasr-image.tar "$FUNASR_IMAGE"
@@ -223,7 +311,9 @@ sha256sum funasr-image.tar funasr-models.tar.gz > SHA256SUMS
 ```
 
 Copy `funasr-image.tar`, `funasr-models.tar.gz`, and `SHA256SUMS` to the
-air-gapped machine, then verify and import them:
+air-gapped machine.
+
+### 3. Import and verify on the air-gapped machine
 
 ```shell
 sha256sum -c SHA256SUMS
@@ -232,22 +322,30 @@ mkdir -p funasr-runtime-resources
 tar -C funasr-runtime-resources -xzf funasr-models.tar.gz
 ```
 
-Start the container on the air-gapped machine:
+The checksum protects the transferred archives. The model-directory check from
+the previous step may also be repeated with
+`funasr-runtime-resources/models/$model` as the base path.
+
+### 4. Run an interactive smoke test
+
+The following command creates a disposable container and opens Bash. It is
+intended only for initial verification; exiting it removes the container:
 
 ```shell
 FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
 
-docker run --rm -it --entrypoint bash --name funasr -p 10095:10095 \
+docker run --rm -it --name funasr-smoke \
+  --entrypoint bash -p 10095:10095 \
   -v "$PWD/funasr-runtime-resources/models:/workspace/models" \
   "$FUNASR_IMAGE"
 ```
 
-Inside the container, use explicit local model paths so the server does not try
-to contact ModelScope:
+Inside the container, use explicit local model paths. This prevents the runtime
+from trying to resolve ModelScope model IDs:
 
 ```shell
 cd /workspace/FunASR/runtime
-bash run_server_2pass.sh \
+. ./run_server_2pass.sh \
   --download-model-dir /workspace/models \
   --model-dir /workspace/models/damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
   --online-model-dir /workspace/models/damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
@@ -255,22 +353,57 @@ bash run_server_2pass.sh \
   --punc-dir /workspace/models/damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
   --lm-dir /workspace/models/damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
   --itn-dir /workspace/models/thuduj12/fst_itn_zh \
-  --certfile 0 >log.txt 2>&1
-tail -f log.txt
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
 ```
 
-For a local test, connect to `ws://127.0.0.1:10095`. If FunASR runs on another
-LAN host, replace `127.0.0.1` with that server's address, and use plain `ws://`
-only on a trusted network:
+Run the Vapor Tap test from another terminal. Then press `Ctrl+C` in the
+container terminal or run `docker stop funasr-smoke` from the second terminal.
+
+### 5. Run FunASR as a persistent service
+
+After the smoke test succeeds, create a detached container without `--rm`.
+The restart policy starts it again after a host or Docker restart:
 
 ```shell
-vapor-tap transcribe --funasr-url ws://127.0.0.1:10095 --seconds 10
+FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+
+docker run -d --name funasr --restart unless-stopped \
+  --entrypoint bash -p 10095:10095 \
+  -v "$PWD/funasr-runtime-resources/models:/workspace/models" \
+  "$FUNASR_IMAGE" -lc '
+cd /workspace/FunASR/runtime
+. ./run_server_2pass.sh \
+  --download-model-dir /workspace/models \
+  --model-dir /workspace/models/damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  --online-model-dir /workspace/models/damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  --vad-dir /workspace/models/damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  --punc-dir /workspace/models/damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  --lm-dir /workspace/models/damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  --itn-dir /workspace/models/thuduj12/fst_itn_zh \
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
+'
 ```
 
-If the server reports a missing local model directory, the staging download was
-incomplete. Reconnect the staging machine, wait for every model to load, and
-package the model directory again. The Vapor Tap capture machine does not need
-FunASR, Python, or the models installed locally.
+Inspect and manage the persistent service with:
+
+```shell
+docker logs -f funasr
+docker stop funasr
+docker start funasr
+```
+
+For a local client, connect to `ws://127.0.0.1:10095`. If FunASR runs on
+another LAN host, use that server's address and expose plain `ws://` only on a
+trusted network. The Vapor Tap capture machine does not need FunASR, Python, or
+the models installed locally. If any local model directory is missing, return
+to the connected staging machine, complete the download and end-to-end test,
+and rebuild the offline bundle.
 
 ## Library API
 

@@ -113,6 +113,32 @@ vapor-tap transcribe --funasr-url wss://asr.example.com/ws
 通过不受信任的网络访问远程服务时应使用 `wss://`。
 `wss://` 服务必须提供操作系统信任且与访问地址匹配的证书。Vapor Tap 不会跳过 TLS 证书校验；使用自签名证书时，应将签发它的 CA 安装到客户端系统的信任库，或在可信的反向代理上终止 TLS。
 
+## FunASR 硬件要求
+
+本项目使用的 `funasr-runtime-sdk-online-cpu` 服务不要求 GPU。根据
+[FunASR 官方实时部署教程](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_tutorial_online_zh.md)，
+官方针对 x86 计算型服务器给出了以下推荐配置：
+
+| CPU | 内存 | 估算并发路数 |
+| --- | ---: | ---: |
+| 4 核 vCPU | 8 GB | 约 16 路 |
+| 16 核 vCPU | 32 GB | 约 32 路 |
+| 64 核 vCPU | 128 GB | 约 100 路 |
+
+这些是推荐规格和近似容量，不是强制最低配置。实际容量还取决于 CPU 性能、模型、
+音频负载和线程配置。对于单路 Vapor Tap 实时转写，可将 Linux 4 核 CPU、8 GB
+内存作为实用起点；多路并发或长期生产运行建议使用 8 核、16 GB 或更高配置。
+
+当前 CPU 镜像支持 AMD64 和 ARM64，但上表的官方容量数据基于 x86 服务器。
+便捷部署脚本仅支持 Linux；Windows 和 macOS 可以运行 Vapor Tap，再连接 Linux
+主机或 Linux 容器中的 FunASR 服务。官方未给出固定的最低磁盘空间。为容纳 Docker
+镜像、离线与流式 ASR 模型、VAD、标点、语言模型、ITN 资源及日志，建议先预留
+至少 15–20 GB，再以实际下载后的文件大小为准。
+
+服务端默认根据可用 CPU 自动计算解码和 I/O 线程数。手工调优时，FunASR 建议让
+`decoder-thread-num × model-thread-num` 接近 CPU 总线程数。其他基于 GPU 的
+FunASR 运行时有独立的 CUDA 和显存要求，但本项目的当前集成不需要 GPU。
+
 ## 可选：离线安装 FunASR 服务
 
 这里的“离线安装”是指将 FunASR 部署到无法访问互联网的机器，不是
@@ -125,31 +151,81 @@ POSIX 环境中执行；Vapor Tap 本身可以运行在 Windows 或 macOS，并�
 使用相同的 CPU 架构。镜像版本来自
 [FunASR 官方实时服务部署文档](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_advanced_guide_online.md)；升级版本时应同时重新准备镜像和模型。
 
-先在可联网的机器上拉取镜像，并让服务启动一次以下载全部模型：
+### 1. 在联网机器下载镜像和模型
+
+拉取固定版本的镜像、创建宿主机模型目录，并进入临时预下载容器的 Bash。下面的
+命令只是进入容器，还没有启动 FunASR 服务：
 
 ```shell
 FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
 
 mkdir -p funasr-airgap/models
 docker pull "$FUNASR_IMAGE"
-docker run --rm -it --entrypoint bash -p 10095:10095 \
+docker run --rm -it --name funasr-prefetch \
+  --entrypoint bash -p 10095:10095 \
   -v "$PWD/funasr-airgap/models:/workspace/models" \
   "$FUNASR_IMAGE"
 ```
 
-进入容器后运行：
+进入容器后，显式指定全部模型并启动服务。联网预下载和离线启动使用相同的模型
+列表，可避免镜像默认值发生变化后下载到不同的模型：
 
 ```shell
 cd /workspace/FunASR/runtime
-bash run_server_2pass.sh \
+. ./run_server_2pass.sh \
   --download-model-dir /workspace/models \
-  --certfile 0 >log.txt 2>&1
-tail -f log.txt
+  --model-dir damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  --online-model-dir damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  --vad-dir damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  --punc-dir damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  --lm-dir damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  --itn-dir thuduj12/fst_itn_zh \
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
 ```
 
-等待日志显示所有模型加载完成并开始监听 `10095` 端口。另开终端确认
-`funasr-airgap/models` 不为空；随后按 `Ctrl+C` 停止查看日志，退出容器。模型位于
-宿主机目录中，不会随 `--rm` 删除。将镜像、模型和校验文件打包：
+官方脚本会把 FunASR 服务放到后台运行。这里使用 `.` 加载脚本，使服务进程仍属于
+当前 Shell；`wait` 会保持容器运行，服务日志则直接显示在当前终端。
+
+### 2. 验证并打包离线资源
+
+保持预下载容器运行，在联网机器的另一个终端检查六个必需模型目录是否全部存在：
+
+```shell
+for model in \
+  damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  thuduj12/fst_itn_zh
+do
+  test -d "funasr-airgap/models/$model" || {
+    echo "missing model directory: $model"
+    exit 1
+  }
+done
+echo "all required model directories are present"
+```
+
+确认服务日志没有下载或模型加载错误，并且已监听 `10095` 端口。播放一段包含语音的
+音频，再从能够访问联网服务端的机器执行一次端到端测试：
+
+```shell
+vapor-tap transcribe --funasr-url ws://127.0.0.1:10095 --seconds 10
+```
+
+如果 Vapor Tap 不在服务端本机运行，将 `127.0.0.1` 换成联网服务端地址。测试成功
+后，在第二个终端停止临时容器：
+
+```shell
+docker stop funasr-prefetch
+```
+
+模型目录挂载在宿主机上，因此 `--rm` 只会删除临时容器，不会删除模型。随后导出
+固定版本的镜像、已验证模型和校验文件：
 
 ```shell
 docker save -o funasr-image.tar "$FUNASR_IMAGE"
@@ -157,8 +233,9 @@ tar -C funasr-airgap -czf funasr-models.tar.gz models
 sha256sum funasr-image.tar funasr-models.tar.gz > SHA256SUMS
 ```
 
-把 `funasr-image.tar`、`funasr-models.tar.gz` 和 `SHA256SUMS` 复制到离线机器，
-校验后导入：
+把 `funasr-image.tar`、`funasr-models.tar.gz` 和 `SHA256SUMS` 复制到离线机器。
+
+### 3. 在离线机器导入并验证
 
 ```shell
 sha256sum -c SHA256SUMS
@@ -167,21 +244,27 @@ mkdir -p funasr-runtime-resources
 tar -C funasr-runtime-resources -xzf funasr-models.tar.gz
 ```
 
-在离线机器启动容器：
+校验和用于确认传输后的归档没有损坏。也可以重复上一步的目录检查，并将检查路径
+改成 `funasr-runtime-resources/models/$model`。
+
+### 4. 进行一次性交互验证
+
+下面的命令会创建一次性容器并进入 Bash，仅用于首次验证；退出后容器会被删除：
 
 ```shell
 FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
 
-docker run --rm -it --entrypoint bash --name funasr -p 10095:10095 \
+docker run --rm -it --name funasr-smoke \
+  --entrypoint bash -p 10095:10095 \
   -v "$PWD/funasr-runtime-resources/models:/workspace/models" \
   "$FUNASR_IMAGE"
 ```
 
-进入容器后使用本地路径启动，避免服务尝试访问 ModelScope：
+进入容器后显式使用本地模型路径，避免运行时尝试解析 ModelScope 模型 ID：
 
 ```shell
 cd /workspace/FunASR/runtime
-bash run_server_2pass.sh \
+. ./run_server_2pass.sh \
   --download-model-dir /workspace/models \
   --model-dir /workspace/models/damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
   --online-model-dir /workspace/models/damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
@@ -189,20 +272,55 @@ bash run_server_2pass.sh \
   --punc-dir /workspace/models/damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
   --lm-dir /workspace/models/damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
   --itn-dir /workspace/models/thuduj12/fst_itn_zh \
-  --certfile 0 >log.txt 2>&1
-tail -f log.txt
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
 ```
 
-本机测试时连接 `ws://127.0.0.1:10095`；FunASR 在另一台局域网机器上时，将
-`127.0.0.1` 换成服务端地址，并只在可信网络中直接使用 `ws://`：
+从另一个终端执行 Vapor Tap 测试。完成后，可在容器终端按 `Ctrl+C`，或从第二个
+终端执行 `docker stop funasr-smoke`。
+
+### 5. 后台长期运行 FunASR
+
+交互验证通过后，创建不带 `--rm` 的后台容器。重启策略会在宿主机或 Docker
+重启后重新启动服务：
 
 ```shell
-vapor-tap transcribe --funasr-url ws://127.0.0.1:10095 --seconds 10
+FUNASR_IMAGE=registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+
+docker run -d --name funasr --restart unless-stopped \
+  --entrypoint bash -p 10095:10095 \
+  -v "$PWD/funasr-runtime-resources/models:/workspace/models" \
+  "$FUNASR_IMAGE" -lc '
+cd /workspace/FunASR/runtime
+. ./run_server_2pass.sh \
+  --download-model-dir /workspace/models \
+  --model-dir /workspace/models/damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx \
+  --online-model-dir /workspace/models/damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx \
+  --vad-dir /workspace/models/damo/speech_fsmn_vad_zh-cn-16k-common-onnx \
+  --punc-dir /workspace/models/damo/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx \
+  --lm-dir /workspace/models/damo/speech_ngram_lm_zh-cn-ai-wesp-fst \
+  --itn-dir /workspace/models/thuduj12/fst_itn_zh \
+  --certfile 0
+server_pid=$!
+trap "kill -TERM $server_pid; wait $server_pid" TERM INT
+wait "$server_pid"
+'
 ```
 
-如果日志提示某个本地模型目录不存在，说明联网机器上的预下载没有完成；重新联网
-启动服务并等待全部模型加载成功后，再重新打包模型目录。Vapor Tap 捕获端无需安装
-FunASR、Python 或模型。
+使用以下命令查看日志和管理后台服务：
+
+```shell
+docker logs -f funasr
+docker stop funasr
+docker start funasr
+```
+
+本机客户端连接 `ws://127.0.0.1:10095`；FunASR 位于另一台局域网机器时，改用
+服务端地址，并只在可信网络中直接使用 `ws://`。Vapor Tap 捕获端无需安装
+FunASR、Python 或模型。如果缺少任何本地模型目录，应回到联网机器完成下载和
+端到端测试，再重新制作离线包。
 
 ## macOS 权限与打包
 
