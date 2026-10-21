@@ -470,15 +470,17 @@ ID.
 
 ## Current validation status
 
-- Windows target: compiled and unit-tested on build 19045, and the real WASAPI
-  loopback path was exercised. The latest saved WAV contained only zero
-  samples, so non-silent capture remains under investigation and must not be
-  treated as validated. A Windows 11 PID smoke test is also still required.
+- Windows target: compiled and unit-tested on Windows 10 build 19045. On
+  2026-10-21, a 10-second WASAPI system-loopback recording while playing a
+  system WAV produced 479,040 stereo frames at 48 kHz: 743,179 of 958,080
+  samples exceeded `1e-6` (77.57%), with a peak of 0.54669 and RMS of 0.04527.
+  This confirms non-zero system-mix capture on that machine; a Windows 11 PID
+  smoke test is still required.
 - macOS target: global and process taps cross-compile with `cargo check --target
   aarch64-apple-darwin`. Permission prompting and non-zero PCM require a macOS
   14.2+ machine for final validation.
 - FunASR: the WebSocket upload, online/offline responses, and final
   acknowledgement were exercised against a real remote service through a
-  temporary TLS proxy because its certificate was untrusted. The latest Windows
-  input was all-zero PCM, so the server's text was a silence hallucination and
-  does not validate recognition quality.
+  temporary TLS proxy because its certificate was untrusted. The new non-zero
+  Windows recording has not yet been sent through a real FunASR service, so
+  end-to-end recognition quality remains unvalidated.
