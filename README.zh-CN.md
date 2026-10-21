@@ -113,6 +113,41 @@ vapor-tap transcribe --funasr-url wss://asr.example.com/ws
 通过不受信任的网络访问远程服务时应使用 `wss://`。
 `wss://` 服务必须提供操作系统信任且与访问地址匹配的证书。Vapor Tap 不会跳过 TLS 证书校验；使用自签名证书时，应将签发它的 CA 安装到客户端系统的信任库，或在可信的反向代理上终止 TLS。
 
+## Windows 一键启动本地 FunASR
+
+[`setup-funasr.ps1`](setup-funasr.ps1) 会检查 Docker Desktop、拉取固定版本的
+FunASR 在线 CPU 镜像、下载必需模型、启动可长期复用的容器，并等待
+`ws://127.0.0.1:10095` 可用。如果尚未安装 Docker Desktop，可通过 `winget`
+安装并在服务就绪后直接启动 Vapor Tap：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-funasr.ps1 -InstallDocker -StartVaporTap
+```
+
+已经安装 Docker Desktop 时去掉 `-InstallDocker`。例如，只转写微信 60 秒：
+
+```powershell
+.\setup-funasr.ps1 -StartVaporTap -App WeChat -Seconds 60
+```
+
+不指定 `-StartVaporTap` 时只准备并启动服务。模型默认保存在
+`%LOCALAPPDATA%\VaporTap\FunASR\models`，以后运行会复用
+`vapor-tap-funasr` 容器；未加密的 WebSocket 只绑定到本机
+`127.0.0.1`。首次下载和加载模型可能需要数分钟。Docker Desktop 安装可能要求
+管理员确认、接受其许可条款或重启 Windows，脚本会明确提示这些情况，不会绕过系统
+要求。
+
+```powershell
+docker logs -f vapor-tap-funasr
+docker stop vapor-tap-funasr
+docker start vapor-tap-funasr
+```
+
+脚本会依次查找同目录下的 `vapor-tap.exe`、`target\release` 中的构建产物以及
+`PATH`；也可以使用 `-VaporTapPath C:\path\to\vapor-tap.exe` 明确指定。镜像和
+模型列表来自
+[FunASR 官方实时服务部署文档](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_advanced_guide_online.md)。
+
 ## FunASR 硬件要求
 
 本项目使用的 `funasr-runtime-sdk-online-cpu` 服务不要求 GPU。根据

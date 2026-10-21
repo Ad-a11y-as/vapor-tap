@@ -170,6 +170,42 @@ server address. Vapor Tap does not bypass TLS verification. For a self-signed
 certificate, install its issuing CA in the client trust store or terminate TLS
 at a trusted reverse proxy.
 
+## One-command local FunASR setup on Windows
+
+[`setup-funasr.ps1`](setup-funasr.ps1) checks Docker Desktop, pulls the pinned
+FunASR online CPU image, downloads the required models, starts a persistent
+container, and waits for `ws://127.0.0.1:10095`. To install Docker Desktop with
+`winget` when it is missing and then start Vapor Tap:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-funasr.ps1 -InstallDocker -StartVaporTap
+```
+
+If Docker Desktop is already installed, omit `-InstallDocker`. To capture a
+specific application for 60 seconds:
+
+```powershell
+.\setup-funasr.ps1 -StartVaporTap -App WeChat -Seconds 60
+```
+
+Omit `-StartVaporTap` to prepare only the service. The script stores models in
+`%LOCALAPPDATA%\VaporTap\FunASR\models`, reuses the `vapor-tap-funasr`
+container on later runs, and exposes the unencrypted WebSocket only on
+`127.0.0.1`. The first model download can take several minutes. Docker Desktop
+installation may require administrator approval, accepting its terms, and a
+Windows restart; the script reports these cases instead of bypassing them.
+
+```powershell
+docker logs -f vapor-tap-funasr
+docker stop vapor-tap-funasr
+docker start vapor-tap-funasr
+```
+
+The script looks for `vapor-tap.exe` beside itself, under `target\release`, or
+on `PATH`; use `-VaporTapPath C:\path\to\vapor-tap.exe` to specify it. It uses
+the versioned image and model set from the
+[official FunASR realtime service guide](https://github.com/modelscope/FunASR/blob/main/runtime/docs/SDK_advanced_guide_online.md).
+
 ## FunASR hardware requirements
 
 The `funasr-runtime-sdk-online-cpu` service used by this project does not
